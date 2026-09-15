@@ -1,0 +1,22 @@
+[package]
+name = "rustic_fault_tests"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0 OR MIT"
+publish = false
+resolver = "3"
+rust-version = { workspace = true }
+description = """
+rustic_fault_tests - scenarios that inject I/O faults into rustic_core operations
+"""
+
+[dependencies]
+rustic_core = { workspace = true }
+rustic_testing = { workspace = true }
+tempfile = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { version = "0.31.1", default-features = false, features = ["mount", "sched", "user"] }
+
+[lints]
+workspace = true

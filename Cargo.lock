@@ -4359,6 +4359,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustic_fault_tests"
+version = "0.1.0"
+dependencies = [
+ "nix",
+ "rustic_core",
+ "rustic_testing",
+ "tempfile",
+]
+
+[[package]]
 name = "rustic_testing"
 version = "0.5.0"
 dependencies = [
