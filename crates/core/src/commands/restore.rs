@@ -569,6 +569,7 @@ impl FirstError {
 /// # Errors
 ///
 /// * If the length of a file could not be set.
+/// * If this function cannot create the thread pool.
 /// * If this function cannot read a pack or an existing file.
 /// * If this function cannot decrypt a blob.
 /// * If this function cannot write a file.
