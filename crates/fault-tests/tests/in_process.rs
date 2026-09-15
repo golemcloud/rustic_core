@@ -15,6 +15,11 @@ fn restore_without_faults() -> TestResult<()> {
 }
 
 #[test]
+fn restore_sparse_without_faults() -> TestResult<()> {
+    scenarios::restore_sparse_without_faults()
+}
+
+#[test]
 fn restore_pack_read() -> TestResult<()> {
     scenarios::restore_pack_read()
 }

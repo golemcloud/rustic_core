@@ -4365,6 +4365,7 @@ dependencies = [
  "nix",
  "rustic_core",
  "rustic_testing",
+ "serde_json",
  "tempfile",
 ]
 

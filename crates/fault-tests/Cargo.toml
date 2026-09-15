@@ -13,6 +13,7 @@ rustic_fault_tests - scenarios that inject I/O faults into rustic_core operation
 [dependencies]
 rustic_core = { workspace = true }
 rustic_testing = { workspace = true }
+serde_json = "1.0.149"
 tempfile = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]

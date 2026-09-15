@@ -3,7 +3,7 @@
 //! A scenario gives `Ok` only when the operation returns the expected error, and no panic occurs.
 
 use std::{
-    fs,
+    fs, iter,
     path::Path,
     sync::{
         Arc,
@@ -35,6 +35,10 @@ pub type Scenario = (&'static str, fn() -> TestResult<()>);
 /// The scenarios that the binary of this crate runs, in this order.
 pub const SCENARIOS: &[Scenario] = &[
     ("restore-without-faults", restore_without_faults),
+    (
+        "restore-sparse-without-faults",
+        restore_sparse_without_faults,
+    ),
     ("restore-pack-read", restore_pack_read),
     ("restore-decrypt", restore_decrypt),
     ("restore-existing-file-read", restore_existing_file_read),
@@ -85,6 +89,48 @@ pub fn restore_without_faults() -> TestResult<()> {
             Err(format!("The restored file `{name}` is not equal to the saved file.").into())
         }
     })
+}
+
+/// A sparse restore without faults gives a saved file that ends in zeros.
+///
+/// The file has 1 MiB of pseudo-random data, and then 9 MiB of zeros.
+/// The default maximum size of a chunk is 8 MiB.
+/// Thus the chunk that holds the first zero byte ends at 9 MiB or before, and the last chunks of the file hold only zeros.
+/// A sparse restore does not write chunks that hold only zeros.
+/// Thus the restored file has its full length only if the restore sets the length of the file one time, before the writes.
+///
+/// # Errors
+///
+/// * If the restore fails.
+/// * If the restored file does not have the length or the content of the saved file.
+pub fn restore_sparse_without_faults() -> TestResult<()> {
+    const MIB: usize = 1024 * 1024;
+    let data: Box<[u8]> = content(9, MIB)
+        .iter()
+        .copied()
+        .chain(iter::repeat_n(0, 9 * MIB))
+        .collect();
+    let saved = save_files(&[("a", &data)])?;
+    let dir = tempdir()?;
+    let mut opts = RestoreOptions::default();
+    // `SparseRestore` is not public, so the scenario sets the option from its serialized name.
+    opts.sparse = serde_json::from_str("\"ByContent\"")?;
+
+    restore_with(&saved, dir.path(), &opts, |_| Ok(()))??;
+
+    let restored = fs::read(dir.path().join("data").join("a"))?;
+    if restored.len() != data.len() {
+        return Err(format!(
+            "The restored file has {} bytes. The saved file has {} bytes.",
+            restored.len(),
+            data.len()
+        )
+        .into());
+    }
+    if restored[..] != data[..] {
+        return Err("The restored file is not equal to the saved file.".into());
+    }
+    Ok(())
 }
 
 /// A restore whose pack reads fail returns the injected backend error.
