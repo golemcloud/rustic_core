@@ -522,7 +522,7 @@ impl FirstError {
     ///
     /// # Arguments
     ///
-    /// * `result` - The result of a step of a task
+    /// * `result` - The value or the error
     ///
     /// # Returns
     ///
@@ -537,16 +537,16 @@ impl FirstError {
         }
     }
 
-    /// Tells if a task stored an error.
+    /// Tells if [`FirstError`] has an error.
     fn is_set(&self) -> bool {
         self.0.get().is_some()
     }
 
-    /// Gives the stored error as the result of all tasks.
+    /// Gives the error of [`FirstError`] as a result.
     ///
     /// # Errors
     ///
-    /// * If a task stored an error.
+    /// * If [`FirstError`] has an error.
     fn into_result(self) -> RusticResult<()> {
         self.0.into_inner().map_or(Ok(()), Err)
     }
@@ -573,7 +573,8 @@ impl FirstError {
 /// * If this function cannot decrypt a blob.
 /// * If this function cannot write a file.
 ///
-/// After the first error, the other tasks stop, and [`restore_contents`] returns the first error.
+/// After the first error, each task stops at its next check of [`FirstError`]. A read, decryption or write that has started does not stop.
+/// Then [`restore_contents`] returns the first error.
 #[allow(clippy::too_many_lines)]
 fn restore_contents<S: Open>(
     repo: &Repository<S>,
