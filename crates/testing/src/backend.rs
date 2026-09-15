@@ -270,7 +270,7 @@ pub mod fault_injection_backend {
             }
         }
 
-        /// Sets the rule that decides the fault for each call after this call.
+        /// Sets the rule that decides the fault for the backend calls that come after.
         ///
         /// The rule replaces the previous rule.
         /// For a call without a fault, the rule returns `None`.
@@ -283,7 +283,7 @@ pub mod fault_injection_backend {
             *self.rule.write().unwrap_or_else(PoisonError::into_inner) = Some(Box::new(rule));
         }
 
-        /// Removes the rule. The calls after this call go to the inner backend without change.
+        /// Removes the rule. The backend calls that come after go to the inner backend without change.
         pub fn clear(&self) {
             *self.rule.write().unwrap_or_else(PoisonError::into_inner) = None;
         }
