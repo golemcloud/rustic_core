@@ -7,14 +7,16 @@ use std::{
 };
 
 use rustic_core::{
-    BackupOptions, ConfigOptions, Credentials, IndexedIdsStatus, KeyOptions, Open, OpenStatus,
-    PathList, Repository, RepositoryBackends, RepositoryOptions, RusticResult,
+    BackupOptions, ConfigOptions, Credentials, IndexedFullStatus, IndexedIdsStatus, KeyOptions,
+    LocalDestination, LsOptions, Open, OpenStatus, PathList, Repository, RepositoryBackends,
+    RepositoryOptions, RestoreOptions, RestorePlan, RusticResult,
     repofile::{MasterKey, SnapshotFile},
 };
 use rustic_testing::{
     TestResult,
     backend::{fault_injection_backend::FaultInjectionBackend, in_memory_backend::InMemoryBackend},
 };
+use tempfile::tempdir;
 
 /// Creates a fault injection backend over an empty backend in memory.
 #[must_use]
@@ -122,4 +124,77 @@ pub fn expect_error<T>(result: RusticResult<T>, expected: &str) -> TestResult<()
             }
         }
     }
+}
+
+/// A repository with a snapshot, and the backend of the repository.
+#[derive(Debug)]
+pub struct SavedRepo {
+    /// The backend of the repository.
+    pub backend: Arc<FaultInjectionBackend>,
+    /// The repository with the full index.
+    pub repo: Repository<IndexedFullStatus>,
+    /// The snapshot to restore.
+    pub snap: SnapshotFile,
+}
+
+/// Saves files in a new repository.
+///
+/// The function writes `files` into a new directory, and backs up the directory with the path `data`.
+///
+/// # Arguments
+///
+/// * `files` - The path of each file relative to the directory, and the content of the file
+///
+/// # Errors
+///
+/// * If the files cannot be written.
+/// * If the repository cannot be created, or the backup fails.
+pub fn save_files(files: &[(&str, &[u8])]) -> TestResult<SavedRepo> {
+    let backend = fault_injection_backend();
+    let source = tempdir()?;
+    write_files(source.path(), files)?;
+    let (repo, snap) = backup(init_repo(&backend)?, source.path(), "data")?;
+    Ok(SavedRepo {
+        backend,
+        repo: repo.to_indexed()?,
+        snap,
+    })
+}
+
+/// Restores the snapshot of `saved` into the directory `dir`.
+///
+/// The function makes the restore plan, calls `before_restore` with the plan, and then restores.
+/// Thus `before_restore` can inject faults or change `dir` after the plan.
+///
+/// # Arguments
+///
+/// * `saved` - The repository and the snapshot to restore
+/// * `dir` - The destination directory
+/// * `opts` - The restore options
+/// * `before_restore` - The function that runs between the plan and the restore
+///
+/// # Returns
+///
+/// The result of the restore.
+///
+/// # Errors
+///
+/// * If the plan cannot be made.
+/// * If `before_restore` fails.
+pub fn restore_with(
+    saved: &SavedRepo,
+    dir: &Path,
+    opts: &RestoreOptions,
+    before_restore: impl FnOnce(&RestorePlan) -> TestResult<()>,
+) -> TestResult<RusticResult<()>> {
+    let node = saved.repo.node_from_snapshot_and_path(&saved.snap, "")?;
+    let ls = saved.repo.ls(&node, &LsOptions::default())?;
+    let dest = LocalDestination::new(
+        dir.to_str().ok_or("the directory path is not UTF-8")?,
+        true,
+        false,
+    )?;
+    let plan = saved.repo.prepare_restore(opts, ls.clone(), &dest, false)?;
+    before_restore(&plan)?;
+    Ok(saved.repo.restore(plan, opts, ls, &dest))
 }
