@@ -20,8 +20,8 @@ use nix::{
 /// # Errors
 ///
 /// * If the kernel refuses the new namespaces.
-/// * If the user ID map or the group ID map cannot be written.
-/// * If the mounts cannot be made private to the new mount namespace.
+/// * If the function cannot write the user ID map or the group ID map.
+/// * If the function cannot make the mounts private to the new mount namespace.
 pub fn enter_user_mount_namespace() -> io::Result<()> {
     let (uid, gid) = (getuid(), getgid());
     unshare(CloneFlags::CLONE_NEWUSER | CloneFlags::CLONE_NEWNS)?;
@@ -38,7 +38,7 @@ pub fn enter_user_mount_namespace() -> io::Result<()> {
     Ok(())
 }
 
-/// A tmpfs that is mounted on a directory.
+/// A tmpfs that [`Tmpfs::mount`] mounts on a directory.
 ///
 /// The drop of the value unmounts the tmpfs.
 #[derive(Debug)]

@@ -82,8 +82,8 @@ pub fn restore_without_faults() -> TestResult<()> {
     restore_with(&saved, dir.path(), &RestoreOptions::default(), |_| Ok(()))??;
 
     files.iter().try_for_each(|(name, data)| {
-        let restored = fs::read(dir.path().join("data").join(name))?;
-        if restored.as_slice() == *data {
+        let restored: Box<[u8]> = fs::read(dir.path().join("data").join(name))?.into_boxed_slice();
+        if *restored == **data {
             Ok(())
         } else {
             Err(format!("The restored file `{name}` is not equal to the saved file.").into())
@@ -118,7 +118,7 @@ pub fn restore_sparse_without_faults() -> TestResult<()> {
 
     restore_with(&saved, dir.path(), &opts, |_| Ok(()))??;
 
-    let restored = fs::read(dir.path().join("data").join("a"))?;
+    let restored: Box<[u8]> = fs::read(dir.path().join("data").join("a"))?.into_boxed_slice();
     if restored.len() != data.len() {
         return Err(format!(
             "The restored file has {} bytes. The saved file has {} bytes.",
@@ -213,13 +213,13 @@ pub fn restore_set_length() -> TestResult<()> {
     let dir = tempdir()?;
 
     let result = restore_with(&saved, dir.path(), &RestoreOptions::default(), |_| {
-        let sub = dir.path().join("data").join("sub");
+        let sub: Box<Path> = dir.path().join("data").join("sub").into_boxed_path();
         fs::remove_dir(&sub)?;
         fs::write(&sub, b"not a directory")?;
         Ok(())
     })?;
 
-    let path = Path::new("data").join("sub").join("a");
+    let path: Box<Path> = Path::new("data").join("sub").join("a").into_boxed_path();
     expect_error(result, &path.display().to_string())
 }
 
@@ -343,7 +343,7 @@ pub fn prune_tree_read() -> TestResult<()> {
     let repo = (0..8).try_fold(
         init_repo(&backend)?.to_indexed_ids()?,
         |repo, seed| -> TestResult<_> {
-            let dir = source.path().join(format!("s{seed}"));
+            let dir: Box<Path> = source.path().join(format!("s{seed}")).into_boxed_path();
             write_files(&dir, &[("a", &content(200 + seed, 1_000))])?;
             let (repo, _) = backup(repo, &dir, "data")?;
             Ok(repo)

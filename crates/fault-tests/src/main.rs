@@ -1,5 +1,6 @@
-//! Runs the fault scenarios, each in a child process that is built with `panic = "abort"`.
+//! Runs each fault scenario in a child process.
 //!
+//! The `panic-abort` profile builds this binary with `panic = "abort"`.
 //! Without arguments, the binary starts itself one time for each scenario, and checks the exit status of each child process.
 //! A scenario passes when its child process exits with the status 0.
 //! A panic stops the child process with the signal `SIGABRT`, and the scenario fails.
@@ -10,6 +11,7 @@
 
 use std::{
     env, io,
+    path::Path,
     process::{Command, ExitCode, ExitStatus},
 };
 
@@ -51,8 +53,8 @@ fn run_one(name: &str) -> ExitCode {
 
 /// Runs each scenario in a child process, and reports the result of each scenario.
 fn run_all() -> ExitCode {
-    let exe = match env::current_exe() {
-        Ok(exe) => exe,
+    let exe: Box<Path> = match env::current_exe() {
+        Ok(exe) => exe.into_boxed_path(),
         Err(err) => {
             eprintln!("Cannot find the path of this binary: {err}");
             return ExitCode::from(2);
@@ -62,7 +64,7 @@ fn run_all() -> ExitCode {
     let failed = SCENARIOS
         .iter()
         .map(|(name, _)| {
-            let status = Command::new(&exe).args(["--scenario", name]).status();
+            let status = Command::new(&*exe).args(["--scenario", name]).status();
             println!("{name}: {}", describe(&status));
             status.is_ok_and(|status| status.success())
         })
@@ -78,10 +80,10 @@ fn run_all() -> ExitCode {
 }
 
 /// Describes the exit status of a child process.
-fn describe(status: &io::Result<ExitStatus>) -> String {
+fn describe(status: &io::Result<ExitStatus>) -> Box<str> {
     match status {
-        Ok(status) if status.success() => "passed".to_string(),
-        Ok(status) => format!("FAILED ({status})"),
-        Err(err) => format!("FAILED (the child process did not start: {err})"),
+        Ok(status) if status.success() => "passed".into(),
+        Ok(status) => format!("FAILED ({status})").into_boxed_str(),
+        Err(err) => format!("FAILED (the child process did not start: {err})").into_boxed_str(),
     }
 }

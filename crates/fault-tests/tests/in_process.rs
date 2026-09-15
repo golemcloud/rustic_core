@@ -3,7 +3,7 @@
 //! The test harness catches a panic, so a scenario that panics fails its test.
 //! A panic in a thread that no test joins does not fail a test.
 //! Thus the scenarios for such threads count the panics of these threads.
-//! The binary of this crate runs the same scenarios in processes that are built with `panic = "abort"`.
+//! The binary of this crate runs the same scenarios in child processes, and the `panic-abort` profile builds that binary with `panic = "abort"`.
 //! The binary also runs the scenario for a full volume, which needs a process that has one thread.
 
 use rustic_fault_tests::scenarios;

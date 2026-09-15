@@ -183,7 +183,7 @@ pub mod in_memory_backend {
     }
 }
 
-/// Backend that injects faults into the calls of another backend, to be used for testing
+/// Backend for tests that injects faults into the calls of another backend
 pub mod fault_injection_backend {
     use std::sync::{Arc, PoisonError, RwLock};
 
@@ -227,7 +227,7 @@ pub mod fault_injection_backend {
     pub enum Fault {
         /// The call returns an error. The inner backend does not get the call.
         Error,
-        /// A read returns its data with the last byte inverted.
+        /// The backend inverts the last byte of the data that a read returns.
         ///
         /// A read that gets no data returns an error.
         /// A listing, a write and a removal return an error, as with [`Fault::Error`].
@@ -270,7 +270,7 @@ pub mod fault_injection_backend {
             }
         }
 
-        /// Sets the rule that decides the fault for each subsequent call.
+        /// Sets the rule that decides the fault for each call after this call.
         ///
         /// The rule replaces the previous rule.
         /// For a call without a fault, the rule returns `None`.
@@ -283,7 +283,7 @@ pub mod fault_injection_backend {
             *self.rule.write().unwrap_or_else(PoisonError::into_inner) = Some(Box::new(rule));
         }
 
-        /// Removes the rule. Subsequent calls go to the inner backend without change.
+        /// Removes the rule. The calls after this call go to the inner backend without change.
         pub fn clear(&self) {
             *self.rule.write().unwrap_or_else(PoisonError::into_inner) = None;
         }

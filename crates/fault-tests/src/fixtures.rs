@@ -30,7 +30,7 @@ pub fn fault_injection_backend() -> Arc<FaultInjectionBackend> {
 ///
 /// # Errors
 ///
-/// * If the repository cannot be created.
+/// * If the function cannot create the repository.
 pub fn init_repo(backend: &Arc<FaultInjectionBackend>) -> TestResult<Repository<OpenStatus>> {
     let backends = RepositoryBackends::new(backend.clone(), None);
     let repo = Repository::new(&RepositoryOptions::default().no_cache(true), &backends)?;
@@ -68,10 +68,10 @@ pub fn content(seed: u64, len: usize) -> Box<[u8]> {
 ///
 /// # Errors
 ///
-/// * If a directory or a file cannot be written.
+/// * If the function cannot write a directory or a file.
 pub fn write_files(dir: &Path, files: &[(&str, &[u8])]) -> TestResult<()> {
     files.iter().try_for_each(|(name, data)| {
-        let path = dir.join(name);
+        let path: Box<Path> = dir.join(name).into_boxed_path();
         fs::create_dir_all(path.parent().ok_or("a file path has a parent")?)?;
         fs::write(&path, data)?;
         Ok(())
@@ -86,7 +86,7 @@ pub fn write_files(dir: &Path, files: &[(&str, &[u8])]) -> TestResult<()> {
 ///
 /// # Errors
 ///
-/// * If the index cannot be read.
+/// * If the function cannot read the index.
 /// * If the backup fails.
 pub fn backup<S: Open>(
     repo: Repository<S>,
@@ -116,7 +116,7 @@ pub fn expect_error<T>(result: RusticResult<T>, expected: &str) -> TestResult<()
         )
         .into()),
         Err(err) => {
-            let text = err.to_string();
+            let text: Box<str> = err.to_string().into_boxed_str();
             if text.contains(expected) {
                 Ok(())
             } else {
@@ -147,8 +147,8 @@ pub struct SavedRepo {
 ///
 /// # Errors
 ///
-/// * If the files cannot be written.
-/// * If the repository cannot be created, or the backup fails.
+/// * If the function cannot write the files.
+/// * If the function cannot create the repository, or the backup fails.
 pub fn save_files(files: &[(&str, &[u8])]) -> TestResult<SavedRepo> {
     let backend = fault_injection_backend();
     let source = tempdir()?;
@@ -179,7 +179,7 @@ pub fn save_files(files: &[(&str, &[u8])]) -> TestResult<SavedRepo> {
 ///
 /// # Errors
 ///
-/// * If the plan cannot be made.
+/// * If the function cannot make the plan.
 /// * If `before_restore` fails.
 pub fn restore_with(
     saved: &SavedRepo,
