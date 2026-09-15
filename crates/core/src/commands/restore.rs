@@ -513,16 +513,12 @@ impl PackInfo {
     }
 }
 
-/// [`FirstError`] keeps the first error that a task of [`restore_contents`] returns.
-///
-/// The tasks share one [`FirstError`].
+/// [`FirstError`] keeps the first error that it gets. It ignores all errors after the first error.
 #[derive(Debug, Default)]
 struct FirstError(OnceLock<Box<RusticError>>);
 
 impl FirstError {
-    /// Gives the value of `result`, or stores the error of `result`.
-    ///
-    /// Only the first stored error stays. This function ignores each subsequent error.
+    /// Gives the value of `result`. If `result` is an error and [`FirstError`] has no error, this function stores the error.
     ///
     /// # Arguments
     ///
@@ -573,11 +569,11 @@ impl FirstError {
 /// # Errors
 ///
 /// * If the length of a file could not be set.
-/// * If a pack or an existing file could not be read.
-/// * If a blob could not be decrypted.
-/// * If a file could not be written.
+/// * If this function cannot read a pack or an existing file.
+/// * If this function cannot decrypt a blob.
+/// * If this function cannot write a file.
 ///
-/// After the first error, the remaining tasks stop and the first error is returned.
+/// After the first error, the other tasks stop, and [`restore_contents`] returns the first error.
 #[allow(clippy::too_many_lines)]
 fn restore_contents<S: Open>(
     repo: &Repository<S>,
