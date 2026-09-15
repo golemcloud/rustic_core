@@ -9,21 +9,25 @@ use std::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
+    time::Duration,
 };
 
-use rustic_core::{FileType, RestoreOptions};
+use rustic_core::{FileType, PruneOptions, RestoreOptions};
 use rustic_testing::{
     TestResult,
     backend::fault_injection_backend::{BackendCall, BackendOp, Fault, INJECTED_FAULT},
 };
 use tempfile::tempdir;
 
-use crate::fixtures::{
-    SavedRepo, backup, content, expect_error, fault_injection_backend, init_repo, restore_with,
-    save_files, write_files,
-};
 #[cfg(target_os = "linux")]
 use crate::volume::{Tmpfs, enter_user_mount_namespace};
+use crate::{
+    fixtures::{
+        SavedRepo, backup, content, expect_error, fault_injection_backend, init_repo, restore_with,
+        save_files, write_files,
+    },
+    panics::{count_panics, wait_until_released},
+};
 
 /// A scenario: its name on the command line, and its function.
 pub type Scenario = (&'static str, fn() -> TestResult<()>);
@@ -41,6 +45,7 @@ pub const SCENARIOS: &[Scenario] = &[
     ),
     #[cfg(target_os = "linux")]
     ("restore-full-volume", restore_full_volume),
+    ("prune-tree-read", prune_tree_read),
 ];
 
 /// The number of reader threads of a restore.
@@ -48,9 +53,12 @@ pub const SCENARIOS: &[Scenario] = &[
 /// This value is `MAX_READER_THREADS_NUM` in `rustic_core`.
 const READER_THREADS: usize = 20;
 
+/// The maximum time for the threads of an operation to stop after the operation returns.
+const RELEASE_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Tells if `call` reads a part of a pack file.
 ///
-/// The content phase of a restore reads the packs in this way.
+/// A restore reads the content of files in this way, and a prune reads trees in this way.
 fn is_pack_read(call: &BackendCall) -> bool {
     call.op == BackendOp::ReadPartial && call.tpe == FileType::Pack
 }
@@ -270,4 +278,41 @@ pub fn restore_full_volume() -> TestResult<()> {
     )?;
 
     expect_error(result, "StorageFull")
+}
+
+/// A prune whose tree reads fail returns the injected backend error, and no thread panics.
+///
+/// The scenario saves eight snapshots with different root trees, so the tree loader starts with eight trees.
+/// The loader has four threads and a channel with space for four trees.
+/// Thus loader threads still send trees after the prune stops at the first error and closes the channel.
+///
+/// # Errors
+///
+/// * If a loader thread does not stop in [`RELEASE_TIMEOUT`].
+/// * If a thread panics while the prune stops.
+/// * If the prune does not return the injected error.
+pub fn prune_tree_read() -> TestResult<()> {
+    let backend = fault_injection_backend();
+    let source = tempdir()?;
+    let repo = (0..8).try_fold(
+        init_repo(&backend)?.to_indexed_ids()?,
+        |repo, seed| -> TestResult<_> {
+            let dir = source.path().join(format!("s{seed}"));
+            write_files(&dir, &[("a", &content(200 + seed, 1_000))])?;
+            let (repo, _) = backup(repo, &dir, "data")?;
+            Ok(repo)
+        },
+    )?;
+
+    let panics = count_panics();
+    backend.inject(|call| is_pack_read(call).then_some(Fault::Error));
+    let result = repo.prune_plan(&PruneOptions::default());
+    drop(repo);
+    wait_until_released(&backend, RELEASE_TIMEOUT)?;
+
+    let new_panics = count_panics() - panics;
+    if new_panics > 0 {
+        return Err(format!("{new_panics} threads panicked while the prune stopped.").into());
+    }
+    expect_error(result, INJECTED_FAULT)
 }

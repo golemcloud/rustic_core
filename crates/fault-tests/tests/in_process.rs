@@ -1,6 +1,8 @@
 //! Runs the fault scenarios in the test harness.
 //!
 //! The test harness catches a panic, so a scenario that panics fails its test.
+//! A panic in a thread that no test joins does not fail a test.
+//! Thus the scenarios for such threads count the panics of these threads.
 //! The binary of this crate runs the same scenarios in processes that are built with `panic = "abort"`.
 //! The binary also runs the scenario for a full volume, which needs a process that has one thread.
 
@@ -35,4 +37,9 @@ fn restore_set_length() -> TestResult<()> {
 #[test]
 fn restore_stops_after_first_error() -> TestResult<()> {
     scenarios::restore_stops_after_first_error()
+}
+
+#[test]
+fn prune_tree_read() -> TestResult<()> {
+    scenarios::prune_tree_read()
 }
