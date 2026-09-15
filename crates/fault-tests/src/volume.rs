@@ -38,7 +38,7 @@ pub fn enter_user_mount_namespace() -> io::Result<()> {
     Ok(())
 }
 
-/// A tmpfs that [`Tmpfs::mount`] mounts on a directory.
+/// A tmpfs on a directory.
 ///
 /// The drop of the value unmounts the tmpfs.
 #[derive(Debug)]

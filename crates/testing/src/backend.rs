@@ -183,7 +183,7 @@ pub mod in_memory_backend {
     }
 }
 
-/// Backend for tests that injects faults into the calls of another backend
+/// Backend that injects faults into the calls of another backend, for tests
 pub mod fault_injection_backend {
     use std::sync::{Arc, PoisonError, RwLock};
 

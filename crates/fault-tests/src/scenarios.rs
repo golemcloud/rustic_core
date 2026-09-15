@@ -1,6 +1,7 @@
 //! Scenarios that inject faults into `rustic_core` operations.
 //!
-//! A scenario gives `Ok` only when the operation returns the expected error, and no panic occurs.
+//! A scenario gives `Ok` only when the operation gives the expected result, and no panic occurs.
+//! Without faults, the expected result is the saved data. With faults, it is the expected error.
 
 use std::{
     fs, iter,
@@ -219,8 +220,14 @@ pub fn restore_set_length() -> TestResult<()> {
         Ok(())
     })?;
 
-    let path: Box<Path> = Path::new("data").join("sub").join("a").into_boxed_path();
-    expect_error(result, &path.display().to_string())
+    expect_error(
+        result,
+        &Path::new("data")
+            .join("sub")
+            .join("a")
+            .display()
+            .to_string(),
+    )
 }
 
 /// A restore stops its remaining pack reads after the first error.
