@@ -7,7 +7,7 @@ use std::{
 
 use bytes::Bytes;
 use constants::DEFAULT_COMMAND;
-use log::{debug, info};
+use log::{debug, info, warn};
 use rand::{
     distr::{Alphanumeric, SampleString},
     rng,
@@ -42,9 +42,13 @@ pub struct RcloneBackend {
 
 impl Drop for RcloneBackend {
     /// Kill the child process.
+    ///
+    /// A panic in a drop stops the process, so a failed kill only gives a warning.
     fn drop(&mut self) {
         debug!("killing rclone.");
-        self.child.kill().unwrap();
+        if let Err(err) = self.child.kill() {
+            warn!("failed to kill rclone: {err}");
+        }
         // TODO: Handle error and log it
         _ = self.handle.take().map(JoinHandle::join);
     }
@@ -280,14 +284,22 @@ impl RcloneBackend {
         debug!("using REST backend with url {}.", url.as_ref());
         let rest = RestBackend::new(rest_url, options)?;
 
+        // No thread joins this thread while it reads, so a panic here would stop the process.
+        // Thus the loop ends on an error.
         let handle = Some(std::thread::spawn(move || {
             loop {
                 let mut line = String::new();
-                if stderr.read_line(&mut line).unwrap() == 0 {
-                    break;
-                }
-                if !line.is_empty() {
-                    info!("rclone output: {line}");
+                match stderr.read_line(&mut line) {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        if !line.is_empty() {
+                            info!("rclone output: {line}");
+                        }
+                    }
+                    Err(err) => {
+                        warn!("failed to read the output of rclone: {err}");
+                        break;
+                    }
                 }
             }
         }));
