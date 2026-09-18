@@ -7,16 +7,16 @@ use std::{
 };
 
 use rustic_core::{
-    BackupOptions, ConfigOptions, Credentials, IndexedFullStatus, IndexedIdsStatus, KeyOptions,
-    LocalDestination, LsOptions, Open, OpenStatus, PathList, Repository, RepositoryBackends,
-    RepositoryOptions, RestoreOptions, RestorePlan, RusticResult,
+    BackupOptions, ConfigOptions, Credentials, FileType, IndexedFullStatus, IndexedIdsStatus,
+    KeyOptions, LocalDestination, LsOptions, Open, OpenStatus, PathList, ReadBackend, Repository,
+    RepositoryBackends, RepositoryOptions, RestoreOptions, RestorePlan, RusticResult, WriteBackend,
     repofile::{MasterKey, SnapshotFile},
 };
 use rustic_testing::{
     TestResult,
     backend::{fault_injection_backend::FaultInjectionBackend, in_memory_backend::InMemoryBackend},
 };
-use tempfile::tempdir;
+use tempfile::{TempDir, tempdir};
 
 /// Creates a fault injection backend over an empty backend in memory.
 #[must_use]
@@ -32,13 +32,49 @@ pub fn fault_injection_backend() -> Arc<FaultInjectionBackend> {
 ///
 /// * If the function cannot create the repository.
 pub fn init_repo(backend: &Arc<FaultInjectionBackend>) -> TestResult<Repository<OpenStatus>> {
+    init_repo_with_key(backend, &MasterKey::new())
+}
+
+/// Creates a repository in `backend` that `key` opens.
+///
+/// The repository uses no cache.
+///
+/// # Errors
+///
+/// * If the function cannot create the repository.
+pub fn init_repo_with_key(
+    backend: &Arc<FaultInjectionBackend>,
+    key: &MasterKey,
+) -> TestResult<Repository<OpenStatus>> {
     let backends = RepositoryBackends::new(backend.clone(), None);
     let repo = Repository::new(&RepositoryOptions::default().no_cache(true), &backends)?;
     Ok(repo.init(
-        &Credentials::Masterkey(MasterKey::new()),
+        &Credentials::Masterkey(key.clone()),
         &KeyOptions::default(),
         &ConfigOptions::default(),
     )?)
+}
+
+/// Opens the repository in `backend` with a cache below the directory `cache_dir`.
+///
+/// # Arguments
+///
+/// * `backend` - The backend that holds the repository
+/// * `key` - The master key of the repository
+/// * `cache_dir` - The directory for the cache
+///
+/// # Errors
+///
+/// * If the function cannot open the repository.
+pub fn open_repo_with_cache(
+    backend: &Arc<FaultInjectionBackend>,
+    key: &MasterKey,
+    cache_dir: &Path,
+) -> TestResult<Repository<OpenStatus>> {
+    let backends = RepositoryBackends::new(backend.clone(), None);
+    let opts = RepositoryOptions::default().cache_dir(cache_dir.to_path_buf());
+    let repo = Repository::new(&opts, &backends)?;
+    Ok(repo.open(&Credentials::Masterkey(key.clone()))?)
 }
 
 /// Gives `len` bytes of pseudo-random data.
@@ -158,6 +194,79 @@ pub fn save_files(files: &[(&str, &[u8])]) -> TestResult<SavedRepo> {
         backend,
         repo: repo.to_indexed()?,
         snap,
+    })
+}
+
+/// A repository that uses a cache, with a snapshot, and the backend of the repository.
+///
+/// The cache is below a temporary directory that lives as long as this value.
+#[derive(Debug)]
+pub struct CachedRepo {
+    /// The backend of the repository.
+    pub backend: Arc<FaultInjectionBackend>,
+    /// The repository with the full index.
+    pub repo: Repository<IndexedFullStatus>,
+    /// The snapshot of the saved files.
+    pub snap: SnapshotFile,
+    /// The directory that holds the cache.
+    pub cache_dir: TempDir,
+}
+
+/// Saves files in a new repository, and opens the repository again with a cache.
+///
+/// The function writes `files` into a new directory, and backs up the directory with the path `data`.
+/// The backup uses no cache, and the cache of the open repository holds no pack file.
+/// Thus each pack read of the open repository reaches the backend.
+///
+/// # Arguments
+///
+/// * `files` - The path of each file relative to the directory, and the content of the file
+///
+/// # Errors
+///
+/// * If the function cannot write the files.
+/// * If the function cannot create the repository, or the backup fails.
+/// * If the function cannot open the repository with a cache.
+pub fn save_files_with_cache(files: &[(&str, &[u8])]) -> TestResult<CachedRepo> {
+    let backend = fault_injection_backend();
+    let key = MasterKey::new();
+    let source = tempdir()?;
+    write_files(source.path(), files)?;
+    let (_, snap) = backup(init_repo_with_key(&backend, &key)?, source.path(), "data")?;
+    let cache_dir = tempdir()?;
+    let repo = open_repo_with_cache(&backend, &key, cache_dir.path())?;
+    Ok(CachedRepo {
+        backend,
+        repo: repo.to_indexed()?,
+        snap,
+        cache_dir,
+    })
+}
+
+/// Replaces each file of the type `tpe` in `backend` with the first `len` bytes of that file.
+///
+/// A file that has `len` bytes or less does not change.
+///
+/// # Arguments
+///
+/// * `backend` - The backend that holds the files
+/// * `tpe` - The type of the files to shorten
+/// * `len` - The maximum number of bytes that a file keeps
+///
+/// # Errors
+///
+/// * If the function cannot list, read, remove or write a file.
+pub fn shorten_files(
+    backend: &Arc<FaultInjectionBackend>,
+    tpe: FileType,
+    len: usize,
+) -> TestResult<()> {
+    backend.list(tpe)?.into_iter().try_for_each(|id| {
+        let data = backend.read_full(tpe, &id)?;
+        let short = data.slice(..len.min(data.len()));
+        backend.remove(tpe, &id, false)?;
+        backend.write_bytes(tpe, &id, false, short.into())?;
+        Ok(())
     })
 }
 

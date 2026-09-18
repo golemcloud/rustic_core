@@ -232,6 +232,12 @@ pub mod fault_injection_backend {
         /// A read that gets no data returns an error.
         /// A listing, a write and a removal return an error, as with [`Fault::Error`].
         Corrupt,
+        /// The backend removes the last byte of the data that a read returns.
+        ///
+        /// Thus a read gets one byte less than it asks for.
+        /// A read that gets no data returns an error.
+        /// A listing, a write and a removal return an error, as with [`Fault::Error`].
+        Truncate,
     }
 
     /// The rule that decides the fault for each call.
@@ -312,7 +318,7 @@ pub mod fault_injection_backend {
         /// # Errors
         ///
         /// * If the rule decides [`Fault::Error`] for `call`.
-        /// * If the rule decides [`Fault::Corrupt`] for `call`, and the read gets no data.
+        /// * If the rule decides [`Fault::Corrupt`] or [`Fault::Truncate`] for `call`, and the read gets no data.
         /// * If `read` fails.
         fn read(
             &self,
@@ -323,6 +329,7 @@ pub mod fault_injection_backend {
                 None => read(),
                 Some(Fault::Error) => Err(injected_error(call)),
                 Some(Fault::Corrupt) => corrupt(read()?).ok_or_else(|| injected_error(call)),
+                Some(Fault::Truncate) => truncate(&read()?).ok_or_else(|| injected_error(call)),
             }
         }
     }
@@ -352,6 +359,16 @@ pub mod fault_injection_backend {
         let last = data.last_mut()?;
         *last = !*last;
         Some(data.into())
+    }
+
+    /// Removes the last byte of `data`.
+    ///
+    /// # Returns
+    ///
+    /// The shorter data, or `None` if `data` is empty.
+    fn truncate(data: &Bytes) -> Option<Bytes> {
+        let shorter = data.len().checked_sub(1)?;
+        Some(data.slice(..shorter))
     }
 
     impl ReadBackend for FaultInjectionBackend {
@@ -560,6 +577,60 @@ pub mod fault_injection_backend {
         fn corrupt_fails_listings_writes_and_removals() {
             let (backend, id) = backend_with_pack(b"pack data");
             backend.inject(|_| Some(Fault::Corrupt));
+            assert!(is_injected(backend.list(FileType::Pack)));
+            assert!(is_injected(backend.list_with_size(FileType::Pack)));
+            assert!(is_injected(backend.write_bytes(
+                FileType::Pack,
+                &Id::random(),
+                false,
+                Bytes::from_static(b"other").into()
+            )));
+            assert!(is_injected(backend.remove(FileType::Pack, &id, false)));
+
+            backend.clear();
+            assert_eq!(backend.list(FileType::Pack).unwrap(), vec![id]);
+        }
+
+        #[test]
+        fn truncate_removes_the_last_byte_of_a_read() {
+            let (backend, id) = backend_with_pack(b"pack data");
+            backend.inject(|_| Some(Fault::Truncate));
+            assert_eq!(
+                backend.read_full(FileType::Pack, &id).unwrap(),
+                Bytes::from_static(b"pack dat")
+            );
+            assert_eq!(
+                backend
+                    .read_partial(FileType::Pack, &id, false, 0, 4)
+                    .unwrap(),
+                Bytes::from_static(b"pac")
+            );
+
+            backend.clear();
+            assert_eq!(
+                backend.read_full(FileType::Pack, &id).unwrap(),
+                Bytes::from_static(b"pack data")
+            );
+        }
+
+        #[test]
+        fn truncate_fails_a_read_of_no_data() {
+            let (backend, id) = backend_with_pack(b"");
+            backend.inject(|_| Some(Fault::Truncate));
+            assert!(is_injected(backend.read_full(FileType::Pack, &id)));
+            assert!(is_injected(backend.read_partial(
+                FileType::Pack,
+                &id,
+                false,
+                0,
+                0
+            )));
+        }
+
+        #[test]
+        fn truncate_fails_listings_writes_and_removals() {
+            let (backend, id) = backend_with_pack(b"pack data");
+            backend.inject(|_| Some(Fault::Truncate));
             assert!(is_injected(backend.list(FileType::Pack)));
             assert!(is_injected(backend.list_with_size(FileType::Pack)));
             assert!(is_injected(backend.write_bytes(
