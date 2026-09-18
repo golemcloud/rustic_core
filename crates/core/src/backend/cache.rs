@@ -684,3 +684,67 @@ impl Cache {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use bytes::Bytes;
+    use tempfile::{TempDir, tempdir};
+
+    use super::{Cache, FileType, Id, RepositoryId};
+
+    /// The content of the cached file of these tests.
+    const CACHED: &[u8] = b"0123456789";
+
+    /// Creates a cache that holds one pack file with [`CACHED`] as its content.
+    ///
+    /// # Returns
+    ///
+    /// The cache, the ID of the pack file, and the directory of the cache. The cache holds its
+    /// files as long as the directory lives.
+    fn cache_with_a_pack() -> (Cache, Id, TempDir) {
+        let dir = tempdir().unwrap();
+        let cache = Cache::new(
+            RepositoryId::from(Id::random()),
+            Some(dir.path().to_path_buf()),
+        )
+        .unwrap();
+        let id = Id::random();
+        cache
+            .write_bytes(FileType::Pack, &id, &Bytes::from_static(CACHED).into())
+            .unwrap();
+        (cache, id, dir)
+    }
+
+    #[test]
+    fn read_partial_gives_a_part_inside_the_file() {
+        let (cache, id, _dir) = cache_with_a_pack();
+
+        let part = cache.read_partial(FileType::Pack, &id, 2, 3).unwrap();
+
+        assert_eq!(part, Some(Bytes::from_static(b"234")));
+    }
+
+    #[test]
+    fn read_partial_gives_a_part_that_ends_at_the_end_of_the_file() {
+        let (cache, id, _dir) = cache_with_a_pack();
+
+        let part = cache.read_partial(FileType::Pack, &id, 2, 8).unwrap();
+
+        assert_eq!(part, Some(Bytes::from_static(b"23456789")));
+    }
+
+    #[test]
+    fn read_partial_fails_for_a_part_that_ends_after_the_file() {
+        let (cache, id, _dir) = cache_with_a_pack();
+
+        let err = cache.read_partial(FileType::Pack, &id, 2, 9).unwrap_err();
+
+        // The message of the range check, not the message of a read that finds the end of the file.
+        let text = err.to_string();
+        assert!(
+            text.contains("The read needs `9` bytes at the offset `2`"),
+            "{text}"
+        );
+        assert!(text.contains("has `10` bytes"), "{text}");
+    }
+}
