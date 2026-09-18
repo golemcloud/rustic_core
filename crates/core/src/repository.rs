@@ -421,7 +421,7 @@ impl<S> Repository<S> {
                 info!("repository {}: password is correct.", self.name);
                 (key, Some(key_id))
             }
-            Credentials::Masterkey(key) => (key.key(), None),
+            Credentials::Masterkey(key) => (key.key()?, None),
         };
 
         // Initialize a new repository with given credentials and options.

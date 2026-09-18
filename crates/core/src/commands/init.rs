@@ -88,7 +88,7 @@ pub(crate) fn init_with_config<S>(
             info!("key {id} successfully added.");
             (key, Some(id))
         }
-        Credentials::Masterkey(key) => (key.key(), None),
+        Credentials::Masterkey(key) => (key.key()?, None),
     };
     save_config(repo, config.clone(), key)?;
 

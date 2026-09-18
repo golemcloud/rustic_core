@@ -12,6 +12,34 @@ use crate::{
 pub(crate) type Nonce = aead::Nonce<Aes256CtrPoly1305Aes>;
 pub(crate) type AeadKey = aes256ctr_poly1305aes::Key;
 
+/// Checks the number of bytes of one part of a key.
+///
+/// The parts come from a key file, so a key file that another program wrote can hold a part that
+/// has the wrong number of bytes.
+///
+/// # Arguments
+///
+/// * `name` - The name of the part
+/// * `part` - The bytes of the part
+/// * `length` - The number of bytes that the part needs
+///
+/// # Errors
+///
+/// * If `part` does not have `length` bytes.
+fn check_part_length(name: &str, part: &[u8], length: usize) -> RusticResult<()> {
+    if part.len() == length {
+        return Ok(());
+    }
+
+    Err(RusticError::new(
+        ErrorKind::Key,
+        "The part `{name}` of the key has `{length}` bytes. It needs `{needed_length}` bytes.",
+    )
+    .attach_context("name", name.to_string())
+    .attach_context("length", part.len().to_string())
+    .attach_context("needed_length", length.to_string()))
+}
+
 /// The `Key` is used to encrypt/MAC and check/decrypt data.
 ///
 /// It is a 64 byte key that is used to derive the AES256 encryption key and the numbers `k` and `r` used in the `Poly1305AES` MAC.
@@ -48,17 +76,24 @@ impl Key {
     ///
     /// # Arguments
     ///
-    /// * `encrypt` - The AES key.
-    /// * `k` - The number k for `Poly1305AES`.
-    /// * `r` - The number r for `Poly1305AES`.
-    #[must_use]
-    pub fn from_keys(encrypt: &[u8], k: &[u8], r: &[u8]) -> Self {
+    /// * `encrypt` - The AES key. It has 32 bytes.
+    /// * `k` - The number k for `Poly1305AES`. It has 16 bytes.
+    /// * `r` - The number r for `Poly1305AES`. It has 16 bytes.
+    ///
+    /// # Errors
+    ///
+    /// * If a part does not have the number of bytes that the part needs.
+    pub fn from_keys(encrypt: &[u8], k: &[u8], r: &[u8]) -> RusticResult<Self> {
+        check_part_length("encrypt", encrypt, 32)?;
+        check_part_length("k", k, 16)?;
+        check_part_length("r", r, 16)?;
+
         let mut key = AeadKey::default();
         key[0..32].copy_from_slice(encrypt);
         key[32..48].copy_from_slice(k);
         key[48..64].copy_from_slice(r);
 
-        Self(key)
+        Ok(Self(key))
     }
 
     /// Returns the AES key and numbers `k`and `r` for `Poly1305AES`.

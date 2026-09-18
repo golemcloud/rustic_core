@@ -155,7 +155,7 @@ impl KeyFile {
                     err,
                 )
             })?
-            .key();
+            .key()?;
 
         Ok(key)
     }
@@ -360,7 +360,11 @@ impl MasterKey {
     }
 
     /// Get the [`Key`] from the [`MasterKey`]
-    pub(crate) fn key(&self) -> Key {
+    ///
+    /// # Errors
+    ///
+    /// * If a part of the key does not have the number of bytes that the part needs.
+    pub(crate) fn key(&self) -> RusticResult<Key> {
         Key::from_keys(&self.encrypt, &self.mac.k, &self.mac.r)
     }
 }
