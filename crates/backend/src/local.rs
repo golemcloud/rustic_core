@@ -338,6 +338,8 @@ impl ReadBackend for LocalBackend {
     /// # Errors
     ///
     /// * If the file could not be opened.
+    /// * If the size of the file could not be read.
+    /// * If the file ends before the end of the range to read.
     /// * If the file could not be sought to the given position.
     /// * If the length of the file could not be converted to u32.
     /// * If the exact length of the file could not be read.
@@ -359,6 +361,32 @@ impl ReadBackend for LocalBackend {
             )
             .attach_context("path", filename.to_string_lossy())
         })?;
+
+        // The file must hold the full range. Without this check, the read allocates a buffer for
+        // a length that the repository gives, and only then finds the end of the file.
+        let file_length = file
+            .metadata()
+            .map_err(|err| {
+                RusticError::with_source(
+                    ErrorKind::Backend,
+                    "Failed to read the size of the file `{path}`. Please check the file and try again.",
+                    err,
+                )
+                .attach_context("path", filename.to_string_lossy())
+            })?
+            .len();
+        let end = u64::from(offset) + u64::from(length);
+        if end > file_length {
+            return Err(RusticError::new(
+                ErrorKind::Backend,
+                "The file `{path}` has `{file_length}` bytes. The read needs `{length}` bytes at the offset `{offset}`.",
+            )
+            .attach_context("path", filename.to_string_lossy())
+            .attach_context("file_length", file_length.to_string())
+            .attach_context("offset", offset.to_string())
+            .attach_context("length", length.to_string()));
+        }
+
         _ = file.seek(SeekFrom::Start(offset.into())).map_err(|err| {
             RusticError::with_source(
                 ErrorKind::Backend,
@@ -601,5 +629,53 @@ impl WriteBackend for LocalBackend {
             warn!("post-delete: {}", err.display_log());
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{env, fs, path::PathBuf};
+
+    use bytes::Bytes;
+    use rustic_core::{FileType, Id, ReadBackend, WriteBackend};
+
+    use super::LocalBackend;
+
+    /// Creates a backend in a new directory below the temporary directory of the system.
+    ///
+    /// # Returns
+    ///
+    /// The backend, and the directory of the backend. The caller removes the directory.
+    fn backend_in_a_new_dir() -> (LocalBackend, PathBuf) {
+        let name = format!("rustic_local_backend_{}", Id::random().to_hex().as_str());
+        let dir = env::temp_dir().join(name);
+        let backend = LocalBackend::new(dir.to_str().unwrap(), []).unwrap();
+        backend.create().unwrap();
+        (backend, dir)
+    }
+
+    #[test]
+    fn read_partial_fails_after_the_end_of_a_file() {
+        let (backend, dir) = backend_in_a_new_dir();
+        let id = Id::random();
+        backend
+            .write_bytes(
+                FileType::Pack,
+                &id,
+                false,
+                Bytes::from_static(b"short").into(),
+            )
+            .unwrap();
+
+        let full = backend.read_partial(FileType::Pack, &id, false, 0, 5);
+        let too_long = backend.read_partial(FileType::Pack, &id, false, 0, 6);
+        let after_the_end = backend.read_partial(FileType::Pack, &id, false, 5, 1);
+        fs::remove_dir_all(dir).unwrap();
+
+        assert_eq!(full.unwrap(), Bytes::from_static(b"short"));
+        let err = too_long.unwrap_err();
+        assert!(err.to_string().contains("The read needs"), "{err}");
+        let err = after_the_end.unwrap_err();
+        assert!(err.to_string().contains("The read needs"), "{err}");
     }
 }

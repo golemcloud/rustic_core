@@ -421,7 +421,7 @@ impl<S> Repository<S> {
                 info!("repository {}: password is correct.", self.name);
                 (key, Some(key_id))
             }
-            Credentials::Masterkey(key) => (key.key(), None),
+            Credentials::Masterkey(key) => (key.key()?, None),
         };
 
         // Initialize a new repository with given credentials and options.
@@ -1743,16 +1743,20 @@ impl<S: IndexedFull> Repository<S> {
     }
 
     /// drop the data pack information from the `Repository` index leaving an `IndexedTree` `Repository`
-    pub fn drop_data_from_index(self) -> Repository<impl IndexedTree> {
-        Repository {
+    ///
+    /// # Errors
+    ///
+    /// * If another user of the index still holds it.
+    pub fn drop_data_from_index(self) -> RusticResult<Repository<impl IndexedTree>> {
+        Ok(Repository {
             name: self.name,
             be: self.be,
             be_hot: self.be_hot,
             be_cold: self.be_cold,
             opts: self.opts,
             pb: self.pb,
-            status: self.status.into_indexed_tree(),
-        }
+            status: self.status.into_indexed_tree()?,
+        })
     }
 }
 

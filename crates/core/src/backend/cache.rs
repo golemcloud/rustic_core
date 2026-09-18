@@ -131,6 +131,7 @@ impl ReadBackend for CachedBackend {
     /// # Errors
     ///
     /// * If the file could not be read.
+    /// * If the file is shorter than the end of the range to read.
     ///
     /// # Returns
     ///
@@ -155,14 +156,31 @@ impl ReadBackend for CachedBackend {
             // read full file, save to cache and return partial content
             match self.be.read_full(tpe, id) {
                 Ok(data) => {
-                    let range = offset as usize..(offset + length) as usize;
-                    if let Err(err) = self.cache.write_bytes(tpe, id, &data.clone().into()) {
+                    let start = offset as usize;
+                    // The file must hold the full range. A shorter file does not go into the
+                    // cache, because a later read of the cached file gives the same error.
+                    let part = start
+                        .checked_add(length as usize)
+                        .and_then(|end| data.get(start..end))
+                        .ok_or_else(|| {
+                            RusticError::new(
+                                ErrorKind::Backend,
+                                "The `{tpe}` file `{id}` has `{file_length}` bytes. The read needs `{length}` bytes at the offset `{offset}`.",
+                            )
+                            .attach_context("tpe", tpe.to_string())
+                            .attach_context("id", id.to_string())
+                            .attach_context("file_length", data.len().to_string())
+                            .attach_context("offset", offset.to_string())
+                            .attach_context("length", length.to_string())
+                        })?;
+                    let part = Bytes::copy_from_slice(part);
+                    if let Err(err) = self.cache.write_bytes(tpe, id, &data.into()) {
                         warn!(
                             "Error in cache backend writing {tpe:?},{id}: {}",
                             err.display_log()
                         );
                     }
-                    Ok(Bytes::copy_from_slice(&data.slice(range)))
+                    Ok(part)
                 }
                 error => error,
             }
@@ -469,6 +487,8 @@ impl Cache {
     /// # Errors
     ///
     /// * If the file could not be read.
+    /// * If the size of the file could not be read.
+    /// * If the file ends before the end of the range to read.
     pub fn read_partial(
         &self,
         tpe: FileType,
@@ -494,6 +514,35 @@ impl Cache {
                 .attach_context("id", id.to_string()));
             }
         };
+
+        // The file must hold the full range. Without this check, the read allocates a buffer for
+        // a length that the repository gives, and only then finds the end of the file.
+        let file_length = file
+            .metadata()
+            .map_err(|err| {
+                RusticError::with_source(
+                    ErrorKind::InputOutput,
+                    "Failed to read the size of the file `{path}`",
+                    err,
+                )
+                .attach_context("path", path.display().to_string())
+                .attach_context("tpe", tpe.to_string())
+                .attach_context("id", id.to_string())
+            })?
+            .len();
+        let end = u64::from(offset) + u64::from(length);
+        if end > file_length {
+            return Err(RusticError::new(
+                ErrorKind::InputOutput,
+                "The file at `{path}` has `{file_length}` bytes. The read needs `{length}` bytes at the offset `{offset}`.",
+            )
+            .attach_context("path", path.display().to_string())
+            .attach_context("tpe", tpe.to_string())
+            .attach_context("id", id.to_string())
+            .attach_context("file_length", file_length.to_string())
+            .attach_context("offset", offset.to_string())
+            .attach_context("length", length.to_string()));
+        }
 
         _ = file
             .seek(SeekFrom::Start(u64::from(offset)))
@@ -633,5 +682,69 @@ impl Cache {
         })?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bytes::Bytes;
+    use tempfile::{TempDir, tempdir};
+
+    use super::{Cache, FileType, Id, RepositoryId};
+
+    /// The content of the cached file of these tests.
+    const CACHED: &[u8] = b"0123456789";
+
+    /// Creates a cache that holds one pack file with [`CACHED`] as its content.
+    ///
+    /// # Returns
+    ///
+    /// The cache, the ID of the pack file, and the directory of the cache. The cache holds its
+    /// files as long as the directory lives.
+    fn cache_with_a_pack() -> (Cache, Id, TempDir) {
+        let dir = tempdir().unwrap();
+        let cache = Cache::new(
+            RepositoryId::from(Id::random()),
+            Some(dir.path().to_path_buf()),
+        )
+        .unwrap();
+        let id = Id::random();
+        cache
+            .write_bytes(FileType::Pack, &id, &Bytes::from_static(CACHED).into())
+            .unwrap();
+        (cache, id, dir)
+    }
+
+    #[test]
+    fn read_partial_gives_a_part_inside_the_file() {
+        let (cache, id, _dir) = cache_with_a_pack();
+
+        let part = cache.read_partial(FileType::Pack, &id, 2, 3).unwrap();
+
+        assert_eq!(part, Some(Bytes::from_static(b"234")));
+    }
+
+    #[test]
+    fn read_partial_gives_a_part_that_ends_at_the_end_of_the_file() {
+        let (cache, id, _dir) = cache_with_a_pack();
+
+        let part = cache.read_partial(FileType::Pack, &id, 2, 8).unwrap();
+
+        assert_eq!(part, Some(Bytes::from_static(b"23456789")));
+    }
+
+    #[test]
+    fn read_partial_fails_for_a_part_that_ends_after_the_file() {
+        let (cache, id, _dir) = cache_with_a_pack();
+
+        let err = cache.read_partial(FileType::Pack, &id, 2, 9).unwrap_err();
+
+        // The message of the range check, not the message of a read that finds the end of the file.
+        let text = err.to_string();
+        assert!(
+            text.contains("The read needs `9` bytes at the offset `2`"),
+            "{text}"
+        );
+        assert!(text.contains("has `10` bytes"), "{text}");
     }
 }

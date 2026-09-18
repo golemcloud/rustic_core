@@ -3,6 +3,7 @@ members = [
   "crates/backend",
   "crates/config",
   "crates/core",
+  "crates/fault-tests",
   "crates/testing",
   "examples/*",
 ]
@@ -69,6 +70,13 @@ rpath = false
 lto = true
 debug-assertions = false
 codegen-units = 1
+
+# The fault scenarios of `rustic_fault_tests` need a process in which a panic
+# stops the process. Run them with:
+# `cargo run -p rustic_fault_tests --profile panic-abort`
+[profile.panic-abort]
+inherits = "dev"
+panic = "abort"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

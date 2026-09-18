@@ -994,10 +994,14 @@ impl PrunePlan {
             (true, _) => 0,
             (false, LimitOption::Unlimited) => u64::MAX,
             (false, LimitOption::Size(size)) => size.as_u64(),
+            // a percentage of 100 or more allows any amount of unused data
+            (false, LimitOption::Percentage(p)) if *p >= 100 => u64::MAX,
             // if percentag is given, we want to have
             // unused <= p/100 * size_after = p/100 * (size_used + unused)
             // which equals (1 - p/100) * unused <= p/100 * size_used
-            (false, LimitOption::Percentage(p)) => (p * self.stats.size_sum().used) / (100 - p),
+            (false, LimitOption::Percentage(p)) => {
+                p.saturating_mul(self.stats.size_sum().used) / (100 - p)
+            }
         };
 
         let max_repack = match max_repack {
@@ -1578,6 +1582,8 @@ impl PackInfo {
 ///
 /// # Errors
 ///
+/// * If a directory node of a tree has no subtree.
+///
 // TODO!: add errors!
 fn find_used_blobs<S>(
     repo: &Repository<S>,
@@ -1609,7 +1615,7 @@ fn find_used_blobs<S>(
 
     let mut tree_streamer = TreeStreamerOnce::new(be, index, snap_trees, p)?;
     while let Some(item) = tree_streamer.next().transpose()? {
-        let (_, tree) = item;
+        let (path, tree) = item;
         for node in tree.nodes {
             match node.node_type {
                 NodeType::File => {
@@ -1621,7 +1627,15 @@ fn find_used_blobs<S>(
                     );
                 }
                 NodeType::Dir => {
-                    _ = ids.insert(BlobId::from(*node.subtree.unwrap()), 0);
+                    let subtree = node.subtree.ok_or_else(|| {
+                        RusticError::new(
+                            ErrorKind::Internal,
+                            "The directory node `{name}` in the tree `{path}` has no subtree.",
+                        )
+                        .attach_context("name", node.name().to_string_lossy())
+                        .attach_context("path", path.display().to_string())
+                    })?;
+                    _ = ids.insert(BlobId::from(*subtree), 0);
                 }
                 _ => {} // nothing to do
             }
@@ -1629,4 +1643,279 @@ fn find_used_blobs<S>(
     }
 
     Ok(ids)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::BTreeMap,
+        sync::{Arc, RwLock},
+    };
+
+    use bytes::Bytes;
+
+    use super::{
+        BlobId, BlobType, BlobTypeMap, ByteSize, EnumSet, ErrorKind, FileType, GlobalIndex,
+        IndexCollector, IndexFile, IndexId, IndexPack, IndexType, Initialize, LimitOption,
+        NodeType, PackInfo, PackSizer, PrunePlan, ReadBackend, RepackReason, RusticError,
+        RusticResult, SnapshotFile, find_used_blobs,
+    };
+    use crate::{
+        Id, RepositoryBackends, RepositoryOptions,
+        backend::{
+            BytesList, WriteBackend,
+            decrypt::{DecryptBackend, DecryptWriteBackend},
+            node::Node,
+        },
+        blob::tree::Tree,
+        crypto::{CryptoKey, aespoly1305::Key},
+        repofile::{ConfigFile, packfile::PackId},
+        repository::Repository,
+    };
+
+    /// Backend in memory for the tests of this module
+    #[derive(Debug, Default)]
+    struct MapBackend(RwLock<Vec<(FileType, Id, Bytes)>>);
+
+    impl MapBackend {
+        /// Gives the file of the type `tpe` with the ID `id`.
+        ///
+        /// # Errors
+        ///
+        /// * If the backend holds no such file.
+        fn get(&self, tpe: FileType, id: &Id) -> RusticResult<Bytes> {
+            self.0
+                .read()
+                .unwrap()
+                .iter()
+                .find(|(file_type, file_id, _)| *file_type == tpe && file_id == id)
+                .map(|(_, _, data)| data.clone())
+                .ok_or_else(|| {
+                    RusticError::new(ErrorKind::Backend, "The backend holds no file `{id}`.")
+                        .attach_context("id", id.to_string())
+                })
+        }
+    }
+
+    impl ReadBackend for MapBackend {
+        fn location(&self) -> String {
+            "map".to_string()
+        }
+
+        fn list_with_size(&self, tpe: FileType) -> RusticResult<Vec<(Id, u32)>> {
+            Ok(self
+                .0
+                .read()
+                .unwrap()
+                .iter()
+                .filter(|(file_type, _, _)| *file_type == tpe)
+                .map(|(_, id, data)| (*id, u32::try_from(data.len()).unwrap()))
+                .collect())
+        }
+
+        fn read_full(&self, tpe: FileType, id: &Id) -> RusticResult<Bytes> {
+            self.get(tpe, id)
+        }
+
+        fn read_partial(
+            &self,
+            tpe: FileType,
+            id: &Id,
+            _cacheable: bool,
+            offset: u32,
+            length: u32,
+        ) -> RusticResult<Bytes> {
+            Ok(self
+                .get(tpe, id)?
+                .slice(offset as usize..(offset + length) as usize))
+        }
+
+        fn warmup_path(&self, _tpe: FileType, id: &Id) -> String {
+            id.to_string()
+        }
+    }
+
+    impl WriteBackend for MapBackend {
+        fn create(&self) -> RusticResult<()> {
+            Ok(())
+        }
+
+        fn write_bytes(
+            &self,
+            tpe: FileType,
+            id: &Id,
+            _cacheable: bool,
+            content: BytesList,
+        ) -> RusticResult<()> {
+            let mut data = Vec::new();
+            for part in content.slice() {
+                data.extend_from_slice(part);
+            }
+            self.0.write().unwrap().push((tpe, *id, data.into()));
+            Ok(())
+        }
+
+        fn remove(&self, tpe: FileType, id: &Id, _cacheable: bool) -> RusticResult<()> {
+            self.0
+                .write()
+                .unwrap()
+                .retain(|(file_type, file_id, _)| *file_type != tpe || file_id != id);
+            Ok(())
+        }
+    }
+
+    /// Creates the pack sizers of a repository that holds nothing.
+    fn pack_sizers() -> BlobTypeMap<PackSizer> {
+        let config = ConfigFile::default();
+        BlobTypeMap::<u64>::init(|_| 0)
+            .map(|blob_type, size| PackSizer::from_config(&config, blob_type, size))
+    }
+
+    /// The number of bytes of used data that [`plan_with_a_candidate`] reports.
+    const USED: u64 = 1_000_000;
+
+    /// The number of bytes of unused data that [`plan_with_a_candidate`] reports.
+    ///
+    /// A prune removes nothing of it before the decision, so this is also the unused data that a
+    /// prune leaves.
+    const UNUSED: u64 = 500_000;
+
+    /// Creates a prune plan that has one candidate to repack.
+    ///
+    /// The candidate is a partly used pack of data blobs. The statistics say that the repository
+    /// holds [`USED`] bytes of used data and [`UNUSED`] bytes of unused data.
+    fn plan_with_a_candidate() -> PrunePlan {
+        let mut index_pack = IndexPack {
+            id: PackId::from(Id::random()),
+            ..IndexPack::default()
+        };
+        index_pack.add(BlobId::from(Id::random()), BlobType::Data, 0, 100_000, None);
+        let mut index = IndexFile::default();
+        index.add(index_pack, false);
+
+        let mut plan = PrunePlan::new(
+            BTreeMap::new(),
+            BTreeMap::new(),
+            vec![(IndexId::from(Id::random()), index)],
+        );
+        plan.stats.size[BlobType::Data].used = USED;
+        plan.stats.size[BlobType::Data].unused = UNUSED;
+        plan.repack_candidates.push((
+            PackInfo {
+                blob_type: BlobType::Data,
+                used_blobs: 1,
+                unused_blobs: 1,
+                used_size: 50_000,
+                unused_size: 50_000,
+            },
+            EnumSet::empty(),
+            RepackReason::PartlyUsed,
+            0,
+            0,
+        ));
+        plan
+    }
+
+    /// Decides what to do with the candidate of `plan`, with `max_unused` in percent.
+    fn decide_with_percentage(plan: &mut PrunePlan, percentage: u64) {
+        plan.decide_repack(
+            &LimitOption::Size(ByteSize::mib(10)),
+            &LimitOption::Percentage(percentage),
+            false,
+            false,
+            &pack_sizers(),
+        );
+    }
+
+    #[test]
+    fn a_full_percentage_of_unused_data_repacks_nothing() {
+        // A percentage of 100 or more allows any amount of unused data, so the plan keeps the
+        // pack. The values also make the old computation `(p * used) / (100 - p)` divide by zero.
+        for percentage in [100, 101, 1000] {
+            let mut plan = plan_with_a_candidate();
+
+            decide_with_percentage(&mut plan, percentage);
+
+            assert_eq!(plan.stats.packs.repack, 0, "percentage {percentage}");
+            assert_eq!(plan.stats.packs.keep, 1, "percentage {percentage}");
+        }
+    }
+
+    #[test]
+    fn a_percentage_that_allows_the_unused_data_repacks_nothing() {
+        // 50% of the data after the prune allows 1_000_000 bytes of unused data, which is more
+        // than the 500_000 bytes that the prune leaves.
+        let mut plan = plan_with_a_candidate();
+
+        decide_with_percentage(&mut plan, 50);
+
+        assert_eq!(plan.stats.packs.repack, 0);
+        assert_eq!(plan.stats.packs.keep, 1);
+    }
+
+    #[test]
+    fn a_percentage_below_the_unused_data_repacks_the_pack() {
+        // 20% of the data after the prune allows 250_000 bytes of unused data, which is less than
+        // the 500_000 bytes that the prune leaves.
+        let mut plan = plan_with_a_candidate();
+
+        decide_with_percentage(&mut plan, 20);
+
+        assert_eq!(plan.stats.packs.repack, 1);
+        assert_eq!(plan.stats.packs.keep, 0);
+    }
+
+    #[test]
+    fn find_used_blobs_needs_a_subtree_for_a_directory_node() {
+        // a tree that holds a directory node without a subtree
+        let mut tree = Tree::new();
+        tree.add(Node {
+            name: "dir".to_string(),
+            node_type: NodeType::Dir,
+            subtree: None,
+            ..Node::default()
+        });
+        let (chunk, tree_id) = tree.serialize().unwrap();
+
+        // a repository that holds the tree in one pack file, and a snapshot of the tree
+        let key = Key::new();
+        let inner = Arc::new(MapBackend::default());
+        let be = DecryptBackend::new(inner.clone(), key);
+        let blob = key.encrypt_data(&chunk).unwrap();
+        let pack_id = PackId::from(Id::random());
+        inner
+            .write_bytes(
+                FileType::Pack,
+                &pack_id,
+                false,
+                Bytes::from(blob.clone()).into(),
+            )
+            .unwrap();
+        let mut pack = IndexPack {
+            id: pack_id,
+            ..IndexPack::default()
+        };
+        pack.add(
+            BlobId::from(*tree_id),
+            BlobType::Tree,
+            0,
+            u32::try_from(blob.len()).unwrap(),
+            None,
+        );
+        let mut collector = IndexCollector::new(IndexType::Full);
+        collector.extend(vec![pack]);
+        let index = GlobalIndex::new_from_index(collector.into_index());
+        let snap = SnapshotFile {
+            tree: tree_id,
+            ..SnapshotFile::default()
+        };
+        _ = be.save_file(&snap).unwrap();
+
+        let backends = RepositoryBackends::new(inner, None);
+        let repo = Repository::new(&RepositoryOptions::default(), &backends).unwrap();
+
+        let err = find_used_blobs(&repo, &be, &index, &[]).unwrap_err();
+
+        assert!(err.to_string().contains("has no subtree"), "{err}");
+    }
 }

@@ -37,6 +37,13 @@ pub struct OpenDALBackend {
     operator: Operator,
 }
 
+/// Gives the tokio runtime of this process, and builds it at the first call.
+///
+/// # Panics
+///
+/// * If the build of the runtime fails. The build needs threads and file descriptors, so it fails
+///   only in a process that is already out of these. A runtime that each caller owns needs a
+///   change of the callers, so this panic stays for now.
 fn runtime() -> &'static Runtime {
     static RUNTIME: OnceLock<Runtime> = OnceLock::new();
     RUNTIME.get_or_init(|| {

@@ -6,7 +6,12 @@ use log::{debug, error, info, trace, warn};
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 
-use std::{cmp::Ordering, collections::BTreeMap, path::PathBuf, sync::Mutex};
+use std::{
+    cmp::Ordering,
+    collections::BTreeMap,
+    path::PathBuf,
+    sync::{Mutex, OnceLock},
+};
 
 use itertools::Itertools;
 use rayon::ThreadPoolBuilder;
@@ -508,6 +513,45 @@ impl PackInfo {
     }
 }
 
+/// [`FirstError`] keeps the first error that it gets. It ignores all errors after the first error.
+#[derive(Debug, Default)]
+struct FirstError(OnceLock<Box<RusticError>>);
+
+impl FirstError {
+    /// Gives the value of `result`. If `result` is an error and [`FirstError`] has no error, this function stores the error.
+    ///
+    /// # Arguments
+    ///
+    /// * `result` - The value or the error
+    ///
+    /// # Returns
+    ///
+    /// The value of `result`, or `None` if `result` is an error.
+    fn ok_or_store<T>(&self, result: RusticResult<T>) -> Option<T> {
+        match result {
+            Ok(value) => Some(value),
+            Err(err) => {
+                _ = self.0.set(err);
+                None
+            }
+        }
+    }
+
+    /// Tells if [`FirstError`] has an error.
+    fn is_set(&self) -> bool {
+        self.0.get().is_some()
+    }
+
+    /// Gives the error of [`FirstError`] as a result.
+    ///
+    /// # Errors
+    ///
+    /// * If [`FirstError`] has an error.
+    fn into_result(self) -> RusticResult<()> {
+        self.0.into_inner().map_or(Ok(()), Err)
+    }
+}
+
 /// [`restore_contents`] restores all files contents as described by `file_infos`
 /// using the [`DecryptReadBackend`] `be` and writing them into the [`LocalDestination`] `dest`.
 ///
@@ -525,7 +569,14 @@ impl PackInfo {
 /// # Errors
 ///
 /// * If the length of a file could not be set.
-/// * If the restore failed.
+/// * If this function cannot create the thread pool.
+/// * If this function cannot read a pack or an existing file.
+/// * If a blob of the index does not lie in the data that the read of its pack gave.
+/// * If this function cannot decrypt a blob.
+/// * If this function cannot write a file.
+///
+/// After the first error, each task stops at its next check of [`FirstError`]. A read, decryption or write that has started does not stop.
+/// Then [`restore_contents`] returns the first error.
 #[allow(clippy::too_many_lines)]
 fn restore_contents<S: Open>(
     repo: &Repository<S>,
@@ -596,6 +647,8 @@ fn restore_contents<S: Open>(
             .attach_context("num_threads", threads.to_string())
         })?;
 
+    let first_error = FirstError::default();
+
     pool.in_place_scope(|s| {
         for PackInfo {
             pack_id,
@@ -609,38 +662,54 @@ fn restore_contents<S: Open>(
         } in packs
         {
             let p = &p;
+            let first_error = &first_error;
 
             if !blobs.is_empty() {
-                // TODO: error handling!
                 s.spawn(move |s1| {
+                    // stop if a task stored an error
+                    if first_error.is_set() {
+                        return;
+                    }
+
                     let read_data = match &from_file {
                         Some((file_idx, offset_file, length_file)) => {
                             // read from existing file
-                            dest.read_at(&filenames[*file_idx], *offset_file, (*length_file).into())
-                                .unwrap()
+                            let path = &filenames[*file_idx];
+                            dest.read_at(path, *offset_file, (*length_file).into())
+                                .map_err(|err| {
+                                    RusticError::with_source(
+                                        ErrorKind::InputOutput,
+                                        "Failed to read from the file `{path}`. Please check the path and try again.",
+                                        err,
+                                    )
+                                    .attach_context("path", path.display().to_string())
+                                })
                         }
                         None => {
                             // read needed part of the pack
                             be.read_partial(FileType::Pack, &pack_id, false, offset, length)
-                                .unwrap()
                         }
+                    };
+                    let Some(read_data) = first_error.ok_or_store(read_data) else {
+                        return;
                     };
 
                     // save into needed files in parallel
                     for (bl, name_dests) in blobs {
+                        // stop if a task stored an error
+                        if first_error.is_set() {
+                            return;
+                        }
                         let size = bl.data_length().into();
                         let data = if from_file.is_some() {
-                            read_data.clone()
+                            Ok(read_data.clone())
                         } else {
-                            let start = usize::try_from(bl.offset - offset)
-                                .expect("convert from u32 to usize should not fail!");
-                            let end = usize::try_from(bl.offset + bl.length - offset)
-                                .expect("convert from u32 to usize should not fail!");
-                            be.read_encrypted_from_partial(
-                                &read_data[start..end],
-                                bl.uncompressed_length,
-                            )
-                            .unwrap()
+                            bl.part_of(&read_data, offset).and_then(|part| {
+                                be.read_encrypted_from_partial(part, bl.uncompressed_length)
+                            })
+                        };
+                        let Some(data) = first_error.ok_or_store(data) else {
+                            return;
                         };
                         let is_sparse = match sparse {
                             SparseRestore::ByContent => data.iter().all(|&b| b == 0),
@@ -650,17 +719,41 @@ fn restore_contents<S: Open>(
                         for (file_idx, start) in name_dests {
                             let data = data.clone();
                             s1.spawn(move |_| {
+                                // stop if a task stored an error
+                                if first_error.is_set() {
+                                    return;
+                                }
                                 let path = &filenames[file_idx];
                                 // Allocate file if it is not yet allocated
                                 let mut sizes_guard = sizes.lock().unwrap();
                                 let filesize = sizes_guard[file_idx];
                                 if filesize > 0 {
-                                    dest.set_length(path, filesize).unwrap();
+                                    let allocated = dest.set_length(path, filesize).map_err(|err| {
+                                        RusticError::with_source(
+                                            ErrorKind::InputOutput,
+                                            "Failed to set the length of the file `{path}`. Please check the path and try again.",
+                                            err,
+                                        )
+                                        .attach_context("path", path.display().to_string())
+                                    });
+                                    if first_error.ok_or_store(allocated).is_none() {
+                                        return;
+                                    }
                                     sizes_guard[file_idx] = 0;
                                 }
                                 drop(sizes_guard);
                                 if !is_sparse {
-                                    dest.write_at(path, start, &data).unwrap();
+                                    let written = dest.write_at(path, start, &data).map_err(|err| {
+                                        RusticError::with_source(
+                                            ErrorKind::InputOutput,
+                                            "Failed to write to the file `{path}`. Please check the path and try again.",
+                                            err,
+                                        )
+                                        .attach_context("path", path.display().to_string())
+                                    });
+                                    if first_error.ok_or_store(written).is_none() {
+                                        return;
+                                    }
                                 }
                                 p.inc(size);
                             });
@@ -671,6 +764,7 @@ fn restore_contents<S: Open>(
         }
     });
 
+    first_error.into_result()?;
     p.finish();
 
     Ok(())

@@ -525,6 +525,7 @@ where
     ///
     /// # Errors
     ///
+    /// * If `node` is a directory node without a subtree.
     /// * If the tree ID is not found in the backend.
     /// * If deserialization fails.
     fn new_streamer(
@@ -535,9 +536,14 @@ where
         recursive: bool,
     ) -> RusticResult<Self> {
         let inner = if node.is_dir() {
-            Tree::from_backend(&be, index, node.subtree.unwrap())?
-                .nodes
-                .into_iter()
+            let subtree = node.subtree.ok_or_else(|| {
+                RusticError::new(
+                    ErrorKind::Internal,
+                    "The directory node `{name}` that the stream starts from has no subtree.",
+                )
+                .attach_context("name", node.name().to_string_lossy())
+            })?;
+            Tree::from_backend(&be, index, subtree)?.nodes.into_iter()
         } else {
             vec![node.clone()].into_iter()
         };
@@ -671,9 +677,12 @@ impl TreeStreamerOnce {
             let out_tx = out_tx.clone();
             let _join_handle = std::thread::spawn(move || {
                 for (path, id, count) in in_rx {
-                    out_tx
+                    if out_tx
                         .send(Tree::from_backend(&be, &index, id).map(|tree| (path, tree, count)))
-                        .unwrap();
+                        .is_err()
+                    {
+                        break;
+                    }
                 }
             });
         }
@@ -948,4 +957,43 @@ pub(crate) fn merge_nodes(
         summary.total_bytes_processed += node.meta.size;
     }
     Ok(node)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::{NodeStreamer, TreeStreamerOptions};
+    use crate::{
+        backend::{
+            MockBackend,
+            decrypt::DecryptBackend,
+            node::{Node, NodeType},
+        },
+        crypto::aespoly1305::Key,
+        index::{
+            GlobalIndex,
+            binarysorted::{IndexCollector, IndexType},
+        },
+    };
+
+    #[test]
+    fn a_node_streamer_needs_a_subtree_for_a_directory_node() {
+        let be = DecryptBackend::new(Arc::new(MockBackend::new()), Key::new());
+        let index = GlobalIndex::new_from_index(IndexCollector::new(IndexType::Full).into_index());
+        let node = Node {
+            name: "dir".to_string(),
+            node_type: NodeType::Dir,
+            subtree: None,
+            ..Node::default()
+        };
+
+        let err = NodeStreamer::new_with_glob(be, &index, &node, &TreeStreamerOptions::default())
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("has no subtree"),
+            "unexpected error: {err}"
+        );
+    }
 }

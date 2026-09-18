@@ -647,6 +647,23 @@ impl<C: CryptoKey> ReadBackend for DecryptBackend<C> {
         self.be.read_full(tpe, id)
     }
 
+    /// Reads a part of a file, and checks the length of the data.
+    ///
+    /// A backend must give the full length that the read asks for. This function returns an error
+    /// if the backend gives less, because the callers use the data at the full length.
+    ///
+    /// # Arguments
+    ///
+    /// * `tpe` - The type of the file.
+    /// * `id` - The id of the file.
+    /// * `cacheable` - Whether the file is cacheable.
+    /// * `offset` - The offset to read from.
+    /// * `length` - The length to read.
+    ///
+    /// # Errors
+    ///
+    /// * If the backend cannot read the part of the file.
+    /// * If the backend gives a number of bytes other than `length`.
     fn read_partial(
         &self,
         tpe: FileType,
@@ -655,7 +672,21 @@ impl<C: CryptoKey> ReadBackend for DecryptBackend<C> {
         offset: u32,
         length: u32,
     ) -> RusticResult<Bytes> {
-        self.be.read_partial(tpe, id, cacheable, offset, length)
+        let data = self.be.read_partial(tpe, id, cacheable, offset, length)?;
+
+        if data.len() != length as usize {
+            return Err(RusticError::new(
+                ErrorKind::Backend,
+                "The read of `{length}` bytes at the offset `{offset}` of the `{tpe}` file `{id}` gave `{read_length}` bytes.",
+            )
+            .attach_context("tpe", tpe.to_string())
+            .attach_context("id", id.to_string())
+            .attach_context("offset", offset.to_string())
+            .attach_context("length", length.to_string())
+            .attach_context("read_length", data.len().to_string()));
+        }
+
+        Ok(data)
     }
 
     fn warmup_path(&self, tpe: FileType, id: &Id) -> String {
