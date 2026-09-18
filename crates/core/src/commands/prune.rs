@@ -1644,3 +1644,207 @@ fn find_used_blobs<S>(
 
     Ok(ids)
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::BTreeMap,
+        sync::{Arc, RwLock},
+    };
+
+    use bytes::Bytes;
+
+    use super::{
+        BlobId, BlobType, BlobTypeMap, ByteSize, ErrorKind, FileType, GlobalIndex, IndexCollector,
+        IndexPack, IndexType, Initialize, LimitOption, NodeType, PackSizer, PrunePlan, ReadBackend,
+        RusticError, RusticResult, SnapshotFile, find_used_blobs,
+    };
+    use crate::{
+        Id, RepositoryBackends, RepositoryOptions,
+        backend::{
+            BytesList, WriteBackend,
+            decrypt::{DecryptBackend, DecryptWriteBackend},
+            node::Node,
+        },
+        blob::tree::Tree,
+        crypto::{CryptoKey, aespoly1305::Key},
+        repofile::{ConfigFile, packfile::PackId},
+        repository::Repository,
+    };
+
+    /// Backend in memory for the tests of this module
+    #[derive(Debug, Default)]
+    struct MapBackend(RwLock<Vec<(FileType, Id, Bytes)>>);
+
+    impl MapBackend {
+        /// Gives the file of the type `tpe` with the ID `id`.
+        ///
+        /// # Errors
+        ///
+        /// * If the backend holds no such file.
+        fn get(&self, tpe: FileType, id: &Id) -> RusticResult<Bytes> {
+            self.0
+                .read()
+                .unwrap()
+                .iter()
+                .find(|(file_type, file_id, _)| *file_type == tpe && file_id == id)
+                .map(|(_, _, data)| data.clone())
+                .ok_or_else(|| {
+                    RusticError::new(ErrorKind::Backend, "The backend holds no file `{id}`.")
+                        .attach_context("id", id.to_string())
+                })
+        }
+    }
+
+    impl ReadBackend for MapBackend {
+        fn location(&self) -> String {
+            "map".to_string()
+        }
+
+        fn list_with_size(&self, tpe: FileType) -> RusticResult<Vec<(Id, u32)>> {
+            Ok(self
+                .0
+                .read()
+                .unwrap()
+                .iter()
+                .filter(|(file_type, _, _)| *file_type == tpe)
+                .map(|(_, id, data)| (*id, u32::try_from(data.len()).unwrap()))
+                .collect())
+        }
+
+        fn read_full(&self, tpe: FileType, id: &Id) -> RusticResult<Bytes> {
+            self.get(tpe, id)
+        }
+
+        fn read_partial(
+            &self,
+            tpe: FileType,
+            id: &Id,
+            _cacheable: bool,
+            offset: u32,
+            length: u32,
+        ) -> RusticResult<Bytes> {
+            Ok(self
+                .get(tpe, id)?
+                .slice(offset as usize..(offset + length) as usize))
+        }
+
+        fn warmup_path(&self, _tpe: FileType, id: &Id) -> String {
+            id.to_string()
+        }
+    }
+
+    impl WriteBackend for MapBackend {
+        fn create(&self) -> RusticResult<()> {
+            Ok(())
+        }
+
+        fn write_bytes(
+            &self,
+            tpe: FileType,
+            id: &Id,
+            _cacheable: bool,
+            content: BytesList,
+        ) -> RusticResult<()> {
+            let mut data = Vec::new();
+            for part in content.slice() {
+                data.extend_from_slice(part);
+            }
+            self.0.write().unwrap().push((tpe, *id, data.into()));
+            Ok(())
+        }
+
+        fn remove(&self, tpe: FileType, id: &Id, _cacheable: bool) -> RusticResult<()> {
+            self.0
+                .write()
+                .unwrap()
+                .retain(|(file_type, file_id, _)| *file_type != tpe || file_id != id);
+            Ok(())
+        }
+    }
+
+    /// Creates a prune plan for a repository that holds nothing.
+    fn empty_plan() -> PrunePlan {
+        PrunePlan::new(BTreeMap::new(), BTreeMap::new(), Vec::new())
+    }
+
+    /// Creates the pack sizers of a repository that holds nothing.
+    fn pack_sizers() -> BlobTypeMap<PackSizer> {
+        let config = ConfigFile::default();
+        BlobTypeMap::<u64>::init(|_| 0)
+            .map(|blob_type, size| PackSizer::from_config(&config, blob_type, size))
+    }
+
+    #[test]
+    fn a_full_percentage_of_unused_data_repacks_nothing() {
+        for percentage in [100, 101, 1000] {
+            let mut plan = empty_plan();
+            plan.stats.size[BlobType::Data].used = 1_000_000;
+            plan.stats.size[BlobType::Data].unused = 1_000_000;
+
+            plan.decide_repack(
+                &LimitOption::Size(ByteSize::mib(10)),
+                &LimitOption::Percentage(percentage),
+                false,
+                false,
+                &pack_sizers(),
+            );
+
+            assert_eq!(plan.stats.packs.repack, 0);
+        }
+    }
+
+    #[test]
+    fn find_used_blobs_needs_a_subtree_for_a_directory_node() {
+        // a tree that holds a directory node without a subtree
+        let mut tree = Tree::new();
+        tree.add(Node {
+            name: "dir".to_string(),
+            node_type: NodeType::Dir,
+            subtree: None,
+            ..Node::default()
+        });
+        let (chunk, tree_id) = tree.serialize().unwrap();
+
+        // a repository that holds the tree in one pack file, and a snapshot of the tree
+        let key = Key::new();
+        let inner = Arc::new(MapBackend::default());
+        let be = DecryptBackend::new(inner.clone(), key);
+        let blob = key.encrypt_data(&chunk).unwrap();
+        let pack_id = PackId::from(Id::random());
+        inner
+            .write_bytes(
+                FileType::Pack,
+                &pack_id,
+                false,
+                Bytes::from(blob.clone()).into(),
+            )
+            .unwrap();
+        let mut pack = IndexPack {
+            id: pack_id,
+            ..IndexPack::default()
+        };
+        pack.add(
+            BlobId::from(*tree_id),
+            BlobType::Tree,
+            0,
+            u32::try_from(blob.len()).unwrap(),
+            None,
+        );
+        let mut collector = IndexCollector::new(IndexType::Full);
+        collector.extend(vec![pack]);
+        let index = GlobalIndex::new_from_index(collector.into_index());
+        let snap = SnapshotFile {
+            tree: tree_id,
+            ..SnapshotFile::default()
+        };
+        _ = be.save_file(&snap).unwrap();
+
+        let backends = RepositoryBackends::new(inner, None);
+        let repo = Repository::new(&RepositoryOptions::default(), &backends).unwrap();
+
+        let err = find_used_blobs(&repo, &be, &index, &[]).unwrap_err();
+
+        assert!(err.to_string().contains("has no subtree"), "{err}");
+    }
+}

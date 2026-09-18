@@ -13,7 +13,10 @@ use std::{
     time::Duration,
 };
 
-use rustic_core::{FileType, PruneOptions, RestoreOptions};
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
+
+use rustic_core::{FileType, LsOptions, PruneOptions, RestoreOptions};
 use rustic_testing::{
     TestResult,
     backend::fault_injection_backend::{BackendCall, BackendOp, Fault, INJECTED_FAULT},
@@ -25,7 +28,7 @@ use crate::volume::{Tmpfs, enter_user_mount_namespace};
 use crate::{
     fixtures::{
         SavedRepo, backup, content, expect_error, fault_injection_backend, init_repo, restore_with,
-        save_files, write_files,
+        save_files, save_files_with_cache, shorten_files, write_files,
     },
     panics::{count_panics, wait_until_released},
 };
@@ -41,6 +44,8 @@ pub const SCENARIOS: &[Scenario] = &[
         restore_sparse_without_faults,
     ),
     ("restore-pack-read", restore_pack_read),
+    ("restore-short-pack-read", restore_short_pack_read),
+    ("cached-tree-read-short-pack", cached_tree_read_short_pack),
     ("restore-decrypt", restore_decrypt),
     ("restore-existing-file-read", restore_existing_file_read),
     ("restore-set-length", restore_set_length),
@@ -51,12 +56,28 @@ pub const SCENARIOS: &[Scenario] = &[
     #[cfg(target_os = "linux")]
     ("restore-full-volume", restore_full_volume),
     ("prune-tree-read", prune_tree_read),
+    (
+        "prune-stops-after-first-error",
+        prune_stops_after_first_error,
+    ),
 ];
 
 /// The number of reader threads of a restore.
 ///
 /// This value is `MAX_READER_THREADS_NUM` in `rustic_core`.
 const READER_THREADS: usize = 20;
+
+/// The number of tree loader threads of a prune.
+///
+/// This value is `MAX_TREE_LOADER` in `rustic_core`. The channel from the loaders holds the same
+/// number of trees.
+const TREE_LOADERS: usize = 4;
+
+/// Part of the message of the error for a backend read that gives too few bytes.
+const SHORT_READ: &str = "The read of";
+
+/// Part of the message of the error for a file that is shorter than the read needs.
+const SHORT_FILE: &str = "The read needs";
 
 /// The maximum time for the threads of an operation to stop after the operation returns.
 const RELEASE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -104,6 +125,7 @@ pub fn restore_without_faults() -> TestResult<()> {
 ///
 /// * If the restore fails.
 /// * If the restored file does not have the length or the content of the saved file.
+/// * If the restored file uses blocks for its full length.
 pub fn restore_sparse_without_faults() -> TestResult<()> {
     const MIB: usize = 1024 * 1024;
     let data: Box<[u8]> = content(9, MIB)
@@ -119,7 +141,8 @@ pub fn restore_sparse_without_faults() -> TestResult<()> {
 
     restore_with(&saved, dir.path(), &opts, |_| Ok(()))??;
 
-    let restored: Box<[u8]> = fs::read(dir.path().join("data").join("a"))?.into_boxed_slice();
+    let path: Box<Path> = dir.path().join("data").join("a").into_boxed_path();
+    let restored: Box<[u8]> = fs::read(&path)?.into_boxed_slice();
     if restored.len() != data.len() {
         return Err(format!(
             "The restored file has {} bytes. The saved file has {} bytes.",
@@ -131,6 +154,48 @@ pub fn restore_sparse_without_faults() -> TestResult<()> {
     if restored[..] != data[..] {
         return Err("The restored file is not equal to the saved file.".into());
     }
+    check_is_sparse(&path, data.len())
+}
+
+/// Checks that the file at `path` uses blocks for less than `len` bytes.
+///
+/// A file system gives the blocks of a file only on Unix, so this function checks nothing on other
+/// systems.
+///
+/// # Arguments
+///
+/// * `path` - The path of the file
+/// * `len` - The length of the file in bytes
+///
+/// # Errors
+///
+/// * If the function cannot read the metadata of the file.
+/// * If the file uses blocks for `len` bytes or more.
+#[cfg(unix)]
+fn check_is_sparse(path: &Path, len: usize) -> TestResult<()> {
+    /// The number of bytes of a block that the metadata of a file counts.
+    const BLOCK: u64 = 512;
+
+    let blocks = fs::metadata(path)?.blocks();
+    let allocated = blocks * BLOCK;
+    if allocated >= len as u64 {
+        return Err(format!(
+            "The restored file uses {allocated} bytes in {blocks} blocks for {len} bytes. A sparse file uses less."
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// Checks that the file at `path` uses blocks for less than `len` bytes.
+///
+/// A file system gives the blocks of a file only on Unix, so this function checks nothing here.
+///
+/// # Errors
+///
+/// * This function returns no error.
+#[cfg(not(unix))]
+fn check_is_sparse(_path: &Path, _len: usize) -> TestResult<()> {
     Ok(())
 }
 
@@ -152,6 +217,54 @@ pub fn restore_pack_read() -> TestResult<()> {
     })?;
 
     expect_error(result, INJECTED_FAULT)
+}
+
+/// A restore whose pack reads give too few bytes returns the error of the short read.
+///
+/// Each pack read gives one byte less than the restore asks for. The restore uses the data of a
+/// read up to the full length, so it needs the check of the length in the backend.
+///
+/// # Errors
+///
+/// * If the restore does not return the error of the short read.
+pub fn restore_short_pack_read() -> TestResult<()> {
+    let data = content(10, 300_000);
+    let saved = save_files(&[("a", &data)])?;
+    let dir = tempdir()?;
+
+    let result = restore_with(&saved, dir.path(), &RestoreOptions::default(), |_| {
+        saved
+            .backend
+            .inject(|call| is_pack_read(call).then_some(Fault::Truncate));
+        Ok(())
+    })?;
+
+    expect_error(result, SHORT_READ)
+}
+
+/// A tree read of a repository with a cache returns an error when the pack file is too short.
+///
+/// The scenario shortens each pack file in the backend to one byte, as an interrupted upload
+/// leaves it. A repository with a cache reads the full pack file and gives the part that the
+/// index names, so it needs the check of the range against the file.
+///
+/// # Errors
+///
+/// * If the function cannot shorten the pack files.
+/// * If the tree read does not return the error of the short file.
+pub fn cached_tree_read_short_pack() -> TestResult<()> {
+    let saved = save_files_with_cache(&[("a", &content(11, 5_000))])?;
+    shorten_files(&saved.backend, FileType::Pack, 1)?;
+
+    let result = saved
+        .repo
+        .node_from_snapshot_and_path(&saved.snap, "")
+        .and_then(|node| {
+            _ = saved.repo.ls(&node, &LsOptions::default())?;
+            Ok(())
+        });
+
+    expect_error(result, SHORT_FILE)
 }
 
 /// A restore whose pack reads give corrupt data returns the error of the decryption.
@@ -368,4 +481,56 @@ pub fn prune_tree_read() -> TestResult<()> {
         return Err(format!("{new_panics} threads panicked while the prune stopped.").into());
     }
     expect_error(result, INJECTED_FAULT)
+}
+
+/// A prune stops its remaining tree reads after the first error.
+///
+/// The scenario saves 40 snapshots with different root trees, so the tree loader starts with 40
+/// trees. Then each tree read fails.
+///
+/// # Errors
+///
+/// * If a loader thread does not stop in [`RELEASE_TIMEOUT`].
+/// * If the prune does not return the injected error.
+/// * If the prune reads more trees than the loaders and their channel hold.
+pub fn prune_stops_after_first_error() -> TestResult<()> {
+    const TREES: usize = 40;
+
+    let backend = fault_injection_backend();
+    let source = tempdir()?;
+    let repo = (0..TREES).try_fold(
+        init_repo(&backend)?.to_indexed_ids()?,
+        |repo, seed| -> TestResult<_> {
+            let dir: Box<Path> = source.path().join(format!("s{seed}")).into_boxed_path();
+            write_files(&dir, &[("a", &content(300 + seed as u64, 1_000))])?;
+            let (repo, _) = backup(repo, &dir, "data")?;
+            Ok(repo)
+        },
+    )?;
+
+    let reads = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&reads);
+    backend.inject(move |call| {
+        is_pack_read(call).then(|| {
+            _ = counted.fetch_add(1, Ordering::SeqCst);
+            Fault::Error
+        })
+    });
+    let result = repo.prune_plan(&PruneOptions::default());
+    drop(repo);
+    wait_until_released(&backend, RELEASE_TIMEOUT)?;
+    expect_error(result, INJECTED_FAULT)?;
+
+    // Each loader thread holds one tree while it waits to send it, and the channel holds as many
+    // trees again. The prune takes one tree out of the channel, which lets one more loader send
+    // and read again. Each further read needs a loader that goes on after a failed send.
+    let reads = reads.load(Ordering::SeqCst);
+    let maximum = 2 * TREE_LOADERS + 2;
+    if reads > maximum {
+        return Err(format!(
+            "The prune read {reads} of {TREES} trees. The maximum is {maximum} reads."
+        )
+        .into());
+    }
+    Ok(())
 }

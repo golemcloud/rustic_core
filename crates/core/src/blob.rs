@@ -282,4 +282,41 @@ mod tests {
             .map(|bl| bl.length);
         assert_eq!(coalesced_length, expected);
     }
+
+    /// Creates a blob location that has no compressed length.
+    const fn location(offset: u32, length: u32) -> BlobLocation {
+        BlobLocation {
+            offset,
+            length,
+            uncompressed_length: None,
+        }
+    }
+
+    #[test]
+    fn part_of_gives_the_bytes_of_the_blob() {
+        let data = b"0123456789";
+        assert_eq!(location(2, 3).part_of(data, 0).unwrap(), b"234");
+        assert_eq!(location(12, 3).part_of(data, 10).unwrap(), b"234");
+        assert_eq!(location(0, 10).part_of(data, 0).unwrap(), data);
+        assert_eq!(location(10, 0).part_of(data, 0).unwrap(), b"");
+    }
+
+    #[test]
+    fn part_of_fails_for_a_blob_that_is_not_in_the_data() {
+        let data = b"0123456789";
+        // the blob ends after the data
+        assert!(location(2, 9).part_of(data, 0).is_err());
+        // the blob starts before the data
+        assert!(location(2, 3).part_of(data, 4).is_err());
+        // the end of the blob does not fit in a u32
+        assert!(location(10, u32::MAX).part_of(data, 0).is_err());
+    }
+
+    #[test]
+    fn data_length_stays_at_zero_for_a_short_blob() {
+        assert_eq!(location(0, 40).data_length(), 8);
+        assert_eq!(location(0, 32).data_length(), 0);
+        assert_eq!(location(0, 5).data_length(), 0);
+        assert_eq!(location(0, 0).data_length(), 0);
+    }
 }

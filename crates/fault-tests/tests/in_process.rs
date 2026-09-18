@@ -25,6 +25,16 @@ fn restore_pack_read() -> TestResult<()> {
 }
 
 #[test]
+fn restore_short_pack_read() -> TestResult<()> {
+    scenarios::restore_short_pack_read()
+}
+
+#[test]
+fn cached_tree_read_short_pack() -> TestResult<()> {
+    scenarios::cached_tree_read_short_pack()
+}
+
+#[test]
 fn restore_decrypt() -> TestResult<()> {
     scenarios::restore_decrypt()
 }
@@ -47,4 +57,9 @@ fn restore_stops_after_first_error() -> TestResult<()> {
 #[test]
 fn prune_tree_read() -> TestResult<()> {
     scenarios::prune_tree_read()
+}
+
+#[test]
+fn prune_stops_after_first_error() -> TestResult<()> {
+    scenarios::prune_stops_after_first_error()
 }

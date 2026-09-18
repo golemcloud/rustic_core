@@ -631,3 +631,51 @@ impl WriteBackend for LocalBackend {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{env, fs, path::PathBuf};
+
+    use bytes::Bytes;
+    use rustic_core::{FileType, Id, ReadBackend, WriteBackend};
+
+    use super::LocalBackend;
+
+    /// Creates a backend in a new directory below the temporary directory of the system.
+    ///
+    /// # Returns
+    ///
+    /// The backend, and the directory of the backend. The caller removes the directory.
+    fn backend_in_a_new_dir() -> (LocalBackend, PathBuf) {
+        let name = format!("rustic_local_backend_{}", Id::random().to_hex().as_str());
+        let dir = env::temp_dir().join(name);
+        let backend = LocalBackend::new(dir.to_str().unwrap(), []).unwrap();
+        backend.create().unwrap();
+        (backend, dir)
+    }
+
+    #[test]
+    fn read_partial_fails_after_the_end_of_a_file() {
+        let (backend, dir) = backend_in_a_new_dir();
+        let id = Id::random();
+        backend
+            .write_bytes(
+                FileType::Pack,
+                &id,
+                false,
+                Bytes::from_static(b"short").into(),
+            )
+            .unwrap();
+
+        let full = backend.read_partial(FileType::Pack, &id, false, 0, 5);
+        let too_long = backend.read_partial(FileType::Pack, &id, false, 0, 6);
+        let after_the_end = backend.read_partial(FileType::Pack, &id, false, 5, 1);
+        fs::remove_dir_all(dir).unwrap();
+
+        assert_eq!(full.unwrap(), Bytes::from_static(b"short"));
+        let err = too_long.unwrap_err();
+        assert!(err.to_string().contains("The read needs"), "{err}");
+        let err = after_the_end.unwrap_err();
+        assert!(err.to_string().contains("The read needs"), "{err}");
+    }
+}

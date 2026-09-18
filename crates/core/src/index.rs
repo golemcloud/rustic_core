@@ -357,3 +357,38 @@ impl GlobalIndex {
 }
 
 impl ReadGlobalIndex for GlobalIndex {}
+
+#[cfg(test)]
+mod tests {
+    use super::{GlobalIndex, constants};
+    use crate::index::binarysorted::{IndexCollector, IndexType};
+
+    /// Creates a global index that holds no blob.
+    fn empty_index() -> GlobalIndex {
+        GlobalIndex::new_from_index(IndexCollector::new(IndexType::Full).into_index())
+    }
+
+    #[test]
+    fn into_index_gives_the_index_of_a_single_user() {
+        assert!(empty_index().into_index().is_ok());
+    }
+
+    #[test]
+    fn into_index_fails_while_another_user_holds_the_index() {
+        let index = empty_index();
+        let other_user = index.clone();
+
+        let err = index.into_index().unwrap_err();
+
+        assert!(
+            err.to_string().contains("still in use"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            err.to_string()
+                .contains(&constants::MAX_INDEX_TRIES.to_string()),
+            "the error does not name the number of tries: {err}"
+        );
+        drop(other_user);
+    }
+}

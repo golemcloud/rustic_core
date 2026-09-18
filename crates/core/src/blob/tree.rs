@@ -958,3 +958,42 @@ pub(crate) fn merge_nodes(
     }
     Ok(node)
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::{NodeStreamer, TreeStreamerOptions};
+    use crate::{
+        backend::{
+            MockBackend,
+            decrypt::DecryptBackend,
+            node::{Node, NodeType},
+        },
+        crypto::aespoly1305::Key,
+        index::{
+            GlobalIndex,
+            binarysorted::{IndexCollector, IndexType},
+        },
+    };
+
+    #[test]
+    fn a_node_streamer_needs_a_subtree_for_a_directory_node() {
+        let be = DecryptBackend::new(Arc::new(MockBackend::new()), Key::new());
+        let index = GlobalIndex::new_from_index(IndexCollector::new(IndexType::Full).into_index());
+        let node = Node {
+            name: "dir".to_string(),
+            node_type: NodeType::Dir,
+            subtree: None,
+            ..Node::default()
+        };
+
+        let err = NodeStreamer::new_with_glob(be, &index, &node, &TreeStreamerOptions::default())
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("has no subtree"),
+            "unexpected error: {err}"
+        );
+    }
+}

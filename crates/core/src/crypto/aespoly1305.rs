@@ -198,4 +198,33 @@ mod tests {
         let res = key.decrypt_data(&data);
         assert!(res.is_err());
     }
+
+    #[test]
+    fn from_keys_takes_the_parts_of_a_key() {
+        let key = Key::new();
+        let (encrypt, k, r) = key.to_keys();
+        let same_key = Key::from_keys(&encrypt, &k, &r).unwrap();
+        assert_eq!(same_key.to_keys(), (encrypt, k, r));
+    }
+
+    #[test]
+    fn from_keys_fails_for_a_wrong_length_of_the_aes_key() {
+        let (encrypt, k, r) = (vec![0; 31], vec![0; 16], vec![0; 16]);
+        let err = Key::from_keys(&encrypt, &k, &r).unwrap_err();
+        assert!(err.to_string().contains("encrypt"), "{err}");
+    }
+
+    #[test]
+    fn from_keys_fails_for_a_wrong_length_of_k() {
+        let (encrypt, k, r) = (vec![0; 32], vec![0; 15], vec![0; 16]);
+        let err = Key::from_keys(&encrypt, &k, &r).unwrap_err();
+        assert!(err.to_string().contains("`k`"), "{err}");
+    }
+
+    #[test]
+    fn from_keys_fails_for_a_wrong_length_of_r() {
+        let (encrypt, k, r) = (vec![0; 32], vec![0; 16], vec![0; 17]);
+        let err = Key::from_keys(&encrypt, &k, &r).unwrap_err();
+        assert!(err.to_string().contains("`r`"), "{err}");
+    }
 }
