@@ -994,10 +994,14 @@ impl PrunePlan {
             (true, _) => 0,
             (false, LimitOption::Unlimited) => u64::MAX,
             (false, LimitOption::Size(size)) => size.as_u64(),
+            // a percentage of 100 or more allows any amount of unused data
+            (false, LimitOption::Percentage(p)) if *p >= 100 => u64::MAX,
             // if percentag is given, we want to have
             // unused <= p/100 * size_after = p/100 * (size_used + unused)
             // which equals (1 - p/100) * unused <= p/100 * size_used
-            (false, LimitOption::Percentage(p)) => (p * self.stats.size_sum().used) / (100 - p),
+            (false, LimitOption::Percentage(p)) => {
+                p.saturating_mul(self.stats.size_sum().used) / (100 - p)
+            }
         };
 
         let max_repack = match max_repack {
