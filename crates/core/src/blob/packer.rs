@@ -1014,6 +1014,7 @@ impl<BE: DecryptFullBackend> BlobCopier<BE> {
     ///
     /// * If the blob could not be added
     /// * If reading the blob from the backend fails
+    /// * If a blob does not lie in the data that the read of the pack gave
     pub fn copy(&self, pack_blobs: CopyPackBlobs, p: &Progress) -> RusticResult<()> {
         let offset = pack_blobs.locations.offset;
         let read_data = self.be_src.read_partial(
@@ -1026,13 +1027,10 @@ impl<BE: DecryptFullBackend> BlobCopier<BE> {
 
         // TODO: write in parallel
         for (blob, blob_id) in pack_blobs.locations.blobs {
-            let start = usize::try_from(blob.offset - offset)
-                .expect("convert from u32 to usize should not fail!");
-            let end = usize::try_from(blob.offset + blob.length - offset)
-                .expect("convert from u32 to usize should not fail!");
-            let data = self
-                .be_src
-                .read_encrypted_from_partial(&read_data[start..end], blob.uncompressed_length)?;
+            let data = self.be_src.read_encrypted_from_partial(
+                blob.part_of(&read_data, offset)?,
+                blob.uncompressed_length,
+            )?;
 
             self.packer.add(data, blob_id).map_err(|err| {
                 RusticError::with_source(

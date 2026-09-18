@@ -571,6 +571,7 @@ impl FirstError {
 /// * If the length of a file could not be set.
 /// * If this function cannot create the thread pool.
 /// * If this function cannot read a pack or an existing file.
+/// * If a blob of the index does not lie in the data that the read of its pack gave.
 /// * If this function cannot decrypt a blob.
 /// * If this function cannot write a file.
 ///
@@ -703,14 +704,9 @@ fn restore_contents<S: Open>(
                         let data = if from_file.is_some() {
                             Ok(read_data.clone())
                         } else {
-                            let start = usize::try_from(bl.offset - offset)
-                                .expect("convert from u32 to usize should not fail!");
-                            let end = usize::try_from(bl.offset + bl.length - offset)
-                                .expect("convert from u32 to usize should not fail!");
-                            be.read_encrypted_from_partial(
-                                &read_data[start..end],
-                                bl.uncompressed_length,
-                            )
+                            bl.part_of(&read_data, offset).and_then(|part| {
+                                be.read_encrypted_from_partial(part, bl.uncompressed_length)
+                            })
                         };
                         let Some(data) = first_error.ok_or_store(data) else {
                             return;

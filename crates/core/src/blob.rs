@@ -7,7 +7,10 @@ use enum_map::{Enum, EnumMap};
 use serde_derive::{Deserialize, Serialize};
 use smallvec::{SmallVec, smallvec};
 
-use crate::define_new_id_struct;
+use crate::{
+    define_new_id_struct,
+    error::{ErrorKind, RusticError, RusticResult},
+};
 
 pub(super) mod constants {
     /// The maximum size of pack-part which is read at once from the backend.
@@ -143,11 +146,42 @@ impl Ord for BlobLocation {
 
 impl BlobLocation {
     /// Get the length of the data contained in this blob
+    ///
+    /// An uncompressed blob holds 32 bytes of cryptographic overhead. A blob whose length is
+    /// smaller gives 0, because the index gives the length and an index can be wrong. The value
+    /// goes into the reads and the slices of the pack data, and those check it and give an error.
     pub const fn data_length(&self) -> u32 {
         match self.uncompressed_length {
-            None => self.length - 32,
+            None => self.length.saturating_sub(32),
             Some(length) => NonZeroU32::get(length),
         }
+    }
+
+    /// Gives the part of `data` that holds this blob.
+    ///
+    /// # Arguments
+    ///
+    /// * `data` - The data that a read of the pack file gave
+    /// * `data_offset` - The offset of `data` in the pack file
+    ///
+    /// # Errors
+    ///
+    /// * If the blob does not lie fully in `data`.
+    pub(crate) fn part_of<'a>(&self, data: &'a [u8], data_offset: u32) -> RusticResult<&'a [u8]> {
+        self.offset
+            .checked_sub(data_offset)
+            .and_then(|start| Some((start, start.checked_add(self.length)?)))
+            .and_then(|(start, end)| data.get(start as usize..end as usize))
+            .ok_or_else(|| {
+                RusticError::new(
+                    ErrorKind::Internal,
+                    "The blob at the offset `{offset}` with the length `{length}` does not lie in the `{data_length}` bytes that the read at the offset `{data_offset}` gave.",
+                )
+                .attach_context("offset", self.offset.to_string())
+                .attach_context("length", self.length.to_string())
+                .attach_context("data_offset", data_offset.to_string())
+                .attach_context("data_length", data.len().to_string())
+            })
     }
 }
 
