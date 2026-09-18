@@ -28,7 +28,11 @@ pub trait IndexedTree: Open {
 /// and additionally the `Id`s of data blobs are also contained in the index.
 pub trait IndexedIds: IndexedTree {
     /// Turn the repository into the `IndexedTree` state by reading and storing a size-optimized index
-    fn into_indexed_tree(self) -> IndexedTreesStatus;
+    ///
+    /// # Errors
+    ///
+    /// * If another user of the index still holds it.
+    fn into_indexed_tree(self) -> RusticResult<IndexedTreesStatus>;
 }
 
 /// A repository which is indexed such that all blob information is fully contained in the index.
@@ -135,11 +139,11 @@ impl IndexedTree for IndexedIdsStatus {
 }
 
 impl IndexedIds for IndexedIdsStatus {
-    fn into_indexed_tree(self) -> IndexedTreesStatus {
-        IndexedTreesStatus {
+    fn into_indexed_tree(self) -> RusticResult<IndexedTreesStatus> {
+        Ok(IndexedTreesStatus {
             open: self.open,
-            index: self.index.drop_data(),
-        }
+            index: self.index.drop_data()?,
+        })
     }
 }
 
@@ -185,11 +189,11 @@ impl IndexedTree for IndexedFullStatus {
 }
 
 impl IndexedIds for IndexedFullStatus {
-    fn into_indexed_tree(self) -> IndexedTreesStatus {
-        IndexedTreesStatus {
+    fn into_indexed_tree(self) -> RusticResult<IndexedTreesStatus> {
+        Ok(IndexedTreesStatus {
             open: self.open,
-            index: self.index.drop_data(),
-        }
+            index: self.index.drop_data()?,
+        })
     }
 }
 

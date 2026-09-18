@@ -287,7 +287,7 @@ pub(crate) fn check_repository<S: Open>(
 
     if opts.read_data {
         let packs = index_be
-            .into_index()
+            .into_index()?
             .into_iter()
             .filter(|p| !missing_packs.contains_key(&p.id))
             .filter(|p| packs.contains(&p.id));

@@ -1,4 +1,4 @@
-use std::{sync::Arc, thread::sleep, time::Duration};
+use std::{sync::Arc, thread::sleep};
 
 use bytes::Bytes;
 use derive_more::Constructor;
@@ -17,6 +17,15 @@ use crate::{
 
 pub(crate) mod binarysorted;
 pub(crate) mod indexer;
+
+pub(super) mod constants {
+    use std::time::Duration;
+
+    /// The number of times that the conversion of a global index into an index tries to take the index.
+    pub(super) const MAX_INDEX_TRIES: usize = 10;
+    /// The time that the conversion of a global index into an index waits between two tries.
+    pub(super) const INDEX_TRY_WAIT: Duration = Duration::from_millis(100);
+}
 
 /// An entry in the index
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Constructor)]
@@ -302,22 +311,48 @@ impl GlobalIndex {
     }
 
     /// Convert the `Arc<Index>` to an Index
-    pub fn into_index(self) -> Index {
-        match Arc::try_unwrap(self.index) {
-            Ok(index) => index,
-            Err(arc) => {
+    ///
+    /// Other threads can still hold the index for a short time after they shut down. Thus this
+    /// function waits and tries again, up to a fixed number of tries.
+    ///
+    /// # Errors
+    ///
+    /// * If another user of the index still holds it after the last try.
+    pub fn into_index(self) -> RusticResult<Index> {
+        let mut index = self.index;
+
+        for _ in 0..constants::MAX_INDEX_TRIES {
+            index = match Arc::try_unwrap(index) {
+                Ok(index) => return Ok(index),
                 // Seems index is still in use; this could be due to some threads using it which didn't yet completely shut down.
                 // sleep a bit to let threads using the index shut down, after this index should be available to unwrap
-                sleep(Duration::from_millis(100));
-                Arc::try_unwrap(arc).expect("index still in use")
-            }
+                Err(index) => index,
+            };
+            sleep(constants::INDEX_TRY_WAIT);
         }
+
+        Arc::try_unwrap(index).map_err(|_| {
+            RusticError::new(
+                ErrorKind::Internal,
+                "The index is still in use after `{tries}` tries in `{wait}` milliseconds each. Please try again.",
+            )
+            .attach_context("tries", constants::MAX_INDEX_TRIES.to_string())
+            .attach_context(
+                "wait",
+                constants::INDEX_TRY_WAIT.as_millis().to_string(),
+            )
+        })
     }
 
-    pub(crate) fn drop_data(self) -> Self {
-        Self {
-            index: Arc::new(self.into_index().drop_data()),
-        }
+    /// Drop the data pack information from the index
+    ///
+    /// # Errors
+    ///
+    /// * If another user of the index still holds it.
+    pub(crate) fn drop_data(self) -> RusticResult<Self> {
+        Ok(Self {
+            index: Arc::new(self.into_index()?.drop_data()),
+        })
     }
 }
 
