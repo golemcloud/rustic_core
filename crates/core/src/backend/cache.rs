@@ -131,6 +131,7 @@ impl ReadBackend for CachedBackend {
     /// # Errors
     ///
     /// * If the file could not be read.
+    /// * If the file is shorter than the end of the range to read.
     ///
     /// # Returns
     ///
@@ -155,14 +156,31 @@ impl ReadBackend for CachedBackend {
             // read full file, save to cache and return partial content
             match self.be.read_full(tpe, id) {
                 Ok(data) => {
-                    let range = offset as usize..(offset + length) as usize;
-                    if let Err(err) = self.cache.write_bytes(tpe, id, &data.clone().into()) {
+                    let start = offset as usize;
+                    // The file must hold the full range. A shorter file does not go into the
+                    // cache, because a later read of the cached file gives the same error.
+                    let part = start
+                        .checked_add(length as usize)
+                        .and_then(|end| data.get(start..end))
+                        .ok_or_else(|| {
+                            RusticError::new(
+                                ErrorKind::Backend,
+                                "The `{tpe}` file `{id}` has `{file_length}` bytes. The read needs `{length}` bytes at the offset `{offset}`.",
+                            )
+                            .attach_context("tpe", tpe.to_string())
+                            .attach_context("id", id.to_string())
+                            .attach_context("file_length", data.len().to_string())
+                            .attach_context("offset", offset.to_string())
+                            .attach_context("length", length.to_string())
+                        })?;
+                    let part = Bytes::copy_from_slice(part);
+                    if let Err(err) = self.cache.write_bytes(tpe, id, &data.into()) {
                         warn!(
                             "Error in cache backend writing {tpe:?},{id}: {}",
                             err.display_log()
                         );
                     }
-                    Ok(Bytes::copy_from_slice(&data.slice(range)))
+                    Ok(part)
                 }
                 error => error,
             }
@@ -469,6 +487,8 @@ impl Cache {
     /// # Errors
     ///
     /// * If the file could not be read.
+    /// * If the size of the file could not be read.
+    /// * If the file ends before the end of the range to read.
     pub fn read_partial(
         &self,
         tpe: FileType,
@@ -494,6 +514,35 @@ impl Cache {
                 .attach_context("id", id.to_string()));
             }
         };
+
+        // The file must hold the full range. Without this check, the read allocates a buffer for
+        // a length that the repository gives, and only then finds the end of the file.
+        let file_length = file
+            .metadata()
+            .map_err(|err| {
+                RusticError::with_source(
+                    ErrorKind::InputOutput,
+                    "Failed to read the size of the file `{path}`",
+                    err,
+                )
+                .attach_context("path", path.display().to_string())
+                .attach_context("tpe", tpe.to_string())
+                .attach_context("id", id.to_string())
+            })?
+            .len();
+        let end = u64::from(offset) + u64::from(length);
+        if end > file_length {
+            return Err(RusticError::new(
+                ErrorKind::InputOutput,
+                "The file at `{path}` has `{file_length}` bytes. The read needs `{length}` bytes at the offset `{offset}`.",
+            )
+            .attach_context("path", path.display().to_string())
+            .attach_context("tpe", tpe.to_string())
+            .attach_context("id", id.to_string())
+            .attach_context("file_length", file_length.to_string())
+            .attach_context("offset", offset.to_string())
+            .attach_context("length", length.to_string()));
+        }
 
         _ = file
             .seek(SeekFrom::Start(u64::from(offset)))
