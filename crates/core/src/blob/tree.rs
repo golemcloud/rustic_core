@@ -525,6 +525,7 @@ where
     ///
     /// # Errors
     ///
+    /// * If `node` is a directory node without a subtree.
     /// * If the tree ID is not found in the backend.
     /// * If deserialization fails.
     fn new_streamer(
@@ -535,9 +536,14 @@ where
         recursive: bool,
     ) -> RusticResult<Self> {
         let inner = if node.is_dir() {
-            Tree::from_backend(&be, index, node.subtree.unwrap())?
-                .nodes
-                .into_iter()
+            let subtree = node.subtree.ok_or_else(|| {
+                RusticError::new(
+                    ErrorKind::Internal,
+                    "The directory node `{name}` that the stream starts from has no subtree.",
+                )
+                .attach_context("name", node.name().to_string_lossy())
+            })?;
+            Tree::from_backend(&be, index, subtree)?.nodes.into_iter()
         } else {
             vec![node.clone()].into_iter()
         };

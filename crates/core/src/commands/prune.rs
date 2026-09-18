@@ -1578,6 +1578,8 @@ impl PackInfo {
 ///
 /// # Errors
 ///
+/// * If a directory node of a tree has no subtree.
+///
 // TODO!: add errors!
 fn find_used_blobs<S>(
     repo: &Repository<S>,
@@ -1609,7 +1611,7 @@ fn find_used_blobs<S>(
 
     let mut tree_streamer = TreeStreamerOnce::new(be, index, snap_trees, p)?;
     while let Some(item) = tree_streamer.next().transpose()? {
-        let (_, tree) = item;
+        let (path, tree) = item;
         for node in tree.nodes {
             match node.node_type {
                 NodeType::File => {
@@ -1621,7 +1623,15 @@ fn find_used_blobs<S>(
                     );
                 }
                 NodeType::Dir => {
-                    _ = ids.insert(BlobId::from(*node.subtree.unwrap()), 0);
+                    let subtree = node.subtree.ok_or_else(|| {
+                        RusticError::new(
+                            ErrorKind::Internal,
+                            "The directory node `{name}` in the tree `{path}` has no subtree.",
+                        )
+                        .attach_context("name", node.name().to_string_lossy())
+                        .attach_context("path", path.display().to_string())
+                    })?;
+                    _ = ids.insert(BlobId::from(*subtree), 0);
                 }
                 _ => {} // nothing to do
             }
