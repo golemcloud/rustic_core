@@ -54,6 +54,7 @@ use std::{
     backtrace::{Backtrace, BacktraceStatus},
     convert::Into,
     fmt::{self, Display},
+    sync::OnceLock,
 };
 
 pub(crate) mod constants {
@@ -557,5 +558,53 @@ impl RusticError {
             backtrace: Some(value.into()),
             ..self
         })
+    }
+}
+
+/// [`FirstError`] keeps the first error that it gets. It ignores all errors after the first error.
+#[derive(Debug, Default)]
+pub(crate) struct FirstError(OnceLock<Box<RusticError>>);
+
+impl FirstError {
+    /// Stores `err` if [`FirstError`] has no error.
+    ///
+    /// # Arguments
+    ///
+    /// * `err` - The error
+    pub(crate) fn store(&self, err: Box<RusticError>) {
+        _ = self.0.set(err);
+    }
+
+    /// Gives the value of `result`. If `result` is an error and [`FirstError`] has no error, this function stores the error.
+    ///
+    /// # Arguments
+    ///
+    /// * `result` - The value or the error
+    ///
+    /// # Returns
+    ///
+    /// The value of `result`, or `None` if `result` is an error.
+    pub(crate) fn ok_or_store<T>(&self, result: RusticResult<T>) -> Option<T> {
+        match result {
+            Ok(value) => Some(value),
+            Err(err) => {
+                self.store(err);
+                None
+            }
+        }
+    }
+
+    /// Tells if [`FirstError`] has an error.
+    pub(crate) fn is_set(&self) -> bool {
+        self.0.get().is_some()
+    }
+
+    /// Gives the error of [`FirstError`] as a result.
+    ///
+    /// # Errors
+    ///
+    /// * If [`FirstError`] has an error.
+    pub(crate) fn into_result(self) -> RusticResult<()> {
+        self.0.into_inner().map_or(Ok(()), Err)
     }
 }

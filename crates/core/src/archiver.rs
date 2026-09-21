@@ -18,7 +18,7 @@ use crate::{
     },
     backend::{ReadSource, ReadSourceEntry, decrypt::DecryptFullBackend},
     blob::BlobType,
-    error::RusticResult,
+    error::{ErrorKind, FirstError, RusticError, RusticResult},
     index::{
         ReadGlobalIndex,
         indexer::{Indexer, SharedIndexer},
@@ -60,6 +60,9 @@ pub struct Archiver<'a, BE: DecryptFullBackend, I: ReadGlobalIndex> {
 
     /// The `SnapshotFile` to write to.
     snap: SnapshotFile,
+
+    /// Fail the backup on each error that makes it skip an entry, for example if it cannot read an entry.
+    fail_on_read_error: bool,
 }
 
 impl<'a, BE: DecryptFullBackend, I: ReadGlobalIndex> Archiver<'a, BE, I> {
@@ -72,6 +75,7 @@ impl<'a, BE: DecryptFullBackend, I: ReadGlobalIndex> Archiver<'a, BE, I> {
     /// * `config` - The config file.
     /// * `parent` - The parent snapshot to use.
     /// * `snap` - The `SnapshotFile` to write to.
+    /// * `fail_on_read_error` - Fail the backup on each error that makes it skip an entry, for example if it cannot read an entry.
     ///
     /// # Errors
     ///
@@ -83,6 +87,7 @@ impl<'a, BE: DecryptFullBackend, I: ReadGlobalIndex> Archiver<'a, BE, I> {
         config: &ConfigFile,
         parent: Parent,
         mut snap: SnapshotFile,
+        fail_on_read_error: bool,
     ) -> RusticResult<Self> {
         let indexer = Indexer::new(be.clone()).into_shared();
         let mut summary = snap.summary.take().unwrap_or_default();
@@ -99,6 +104,7 @@ impl<'a, BE: DecryptFullBackend, I: ReadGlobalIndex> Archiver<'a, BE, I> {
             be,
             index,
             snap,
+            fail_on_read_error,
         })
     }
 
@@ -124,6 +130,7 @@ impl<'a, BE: DecryptFullBackend, I: ReadGlobalIndex> Archiver<'a, BE, I> {
     /// * If sending the message to the raw packer fails.
     /// * If the index file could not be serialized.
     /// * If the time is not in the range of `Local::now()`.
+    /// * If `fail_on_read_error` is set and this function cannot read an entry. Then this function writes no snapshot file.
     pub fn archive<R>(
         mut self,
         src: &R,
@@ -138,6 +145,10 @@ impl<'a, BE: DecryptFullBackend, I: ReadGlobalIndex> Archiver<'a, BE, I> {
         <R as ReadSource>::Open: Send,
         <R as ReadSource>::Iter: Send,
     {
+        let fail_on_read_error = self.fail_on_read_error;
+        // Keeps the first error of an entry if `fail_on_read_error` is set.
+        let first_error = FirstError::default();
+
         scope(|s| -> RusticResult<_> {
             // determine backup size in parallel to running backup
             let src_size_handle = s.spawn(|| {
@@ -150,10 +161,17 @@ impl<'a, BE: DecryptFullBackend, I: ReadGlobalIndex> Archiver<'a, BE, I> {
                 }
             });
 
+            // stop reading the source after the first error of an entry
+            let entries = src.entries().take_while(|_| !first_error.is_set());
+
             // filter out errors and handle as_path
-            let iter = src.entries().filter_map(|item| match item {
+            let iter = entries.filter_map(|item| match item {
                 Err(err) => {
-                    warn!("ignoring error: {}", err.display_log());
+                    if fail_on_read_error {
+                        first_error.store(err);
+                    } else {
+                        warn!("ignoring error: {}", err.display_log());
+                    }
                     None
                 }
                 Ok(ReadSourceEntry { path, node, open }) => {
@@ -186,7 +204,15 @@ impl<'a, BE: DecryptFullBackend, I: ReadGlobalIndex> Archiver<'a, BE, I> {
                 |item| match self.parent.process(&self.be, self.index, item) {
                     Ok(item) => Some(item),
                     Err(err) => {
-                        warn!("ignoring error reading parent snapshot: {err:?}");
+                        if fail_on_read_error {
+                            first_error.store(RusticError::with_source(
+                                ErrorKind::Internal,
+                                "The tree stack of the parent snapshot is empty.",
+                                err,
+                            ));
+                        } else {
+                            warn!("ignoring error reading parent snapshot: {err:?}");
+                        }
                         None
                     }
                 },
@@ -197,7 +223,11 @@ impl<'a, BE: DecryptFullBackend, I: ReadGlobalIndex> Archiver<'a, BE, I> {
             .filter_map(|item| match item {
                 Ok(item) => Some(item),
                 Err(err) => {
-                    warn!("ignoring error: {}", err.display_log());
+                    if fail_on_read_error {
+                        first_error.store(err);
+                    } else {
+                        warn!("ignoring error: {}", err.display_log());
+                    }
                     None
                 }
             })
@@ -209,6 +239,9 @@ impl<'a, BE: DecryptFullBackend, I: ReadGlobalIndex> Archiver<'a, BE, I> {
 
             Ok(())
         })?;
+
+        // If the backup cannot read an entry, return the error here, before the backup writes the snapshot file.
+        first_error.into_result()?;
 
         let stats = self.file_archiver.finalize()?;
         let (id, mut summary) = self.tree_archiver.finalize(self.parent.tree_id())?;

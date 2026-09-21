@@ -6,12 +6,7 @@ use log::{debug, error, info, trace, warn};
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 
-use std::{
-    cmp::Ordering,
-    collections::BTreeMap,
-    path::PathBuf,
-    sync::{Mutex, OnceLock},
-};
+use std::{cmp::Ordering, collections::BTreeMap, path::PathBuf, sync::Mutex};
 
 use itertools::Itertools;
 use rayon::ThreadPoolBuilder;
@@ -25,7 +20,7 @@ use crate::{
         node::{Node, NodeType},
     },
     blob::{BlobLocation, BlobLocations},
-    error::{ErrorKind, RusticError, RusticResult},
+    error::{ErrorKind, FirstError, RusticError, RusticResult},
     repofile::packfile::PackId,
     repository::{IndexedFull, IndexedTree, Open, Repository},
 };
@@ -510,45 +505,6 @@ impl PackInfo {
         } else {
             Err((self, other))
         }
-    }
-}
-
-/// [`FirstError`] keeps the first error that it gets. It ignores all errors after the first error.
-#[derive(Debug, Default)]
-struct FirstError(OnceLock<Box<RusticError>>);
-
-impl FirstError {
-    /// Gives the value of `result`. If `result` is an error and [`FirstError`] has no error, this function stores the error.
-    ///
-    /// # Arguments
-    ///
-    /// * `result` - The value or the error
-    ///
-    /// # Returns
-    ///
-    /// The value of `result`, or `None` if `result` is an error.
-    fn ok_or_store<T>(&self, result: RusticResult<T>) -> Option<T> {
-        match result {
-            Ok(value) => Some(value),
-            Err(err) => {
-                _ = self.0.set(err);
-                None
-            }
-        }
-    }
-
-    /// Tells if [`FirstError`] has an error.
-    fn is_set(&self) -> bool {
-        self.0.get().is_some()
-    }
-
-    /// Gives the error of [`FirstError`] as a result.
-    ///
-    /// # Errors
-    ///
-    /// * If [`FirstError`] has an error.
-    fn into_result(self) -> RusticResult<()> {
-        self.0.into_inner().map_or(Ok(()), Err)
     }
 }
 

@@ -176,6 +176,22 @@ pub struct BackupOptions {
     #[cfg_attr(feature = "merge", merge(strategy = conflate::bool::overwrite_false))]
     pub dry_run: bool,
 
+    /// Fail the backup if it cannot read an entry of the source
+    ///
+    /// With this option, the backup returns an error if it cannot read an entry. Examples are a directory
+    /// that it cannot list, an entry whose metadata it cannot read, and a file that it cannot open or read.
+    /// The backup also fails on each other error that makes it skip an entry, for example an error of the
+    /// pack writer. Then the backup does not write a snapshot file. After the first such error, the backup
+    /// stops reading the source. If this option is not set, the backup skips each such entry and logs a
+    /// warning.
+    ///
+    /// This option does not apply to extended attributes. If the backup cannot read the extended attributes
+    /// of an entry, it logs a warning and saves the entry without them. This option does not check the exit
+    /// status of a stdin command.
+    #[cfg_attr(feature = "clap", clap(long))]
+    #[cfg_attr(feature = "merge", merge(strategy = conflate::bool::overwrite_false))]
+    pub fail_on_read_error: bool,
+
     #[cfg_attr(feature = "clap", clap(flatten))]
     #[serde(flatten)]
     /// Options how to use a parent snapshot
@@ -218,6 +234,7 @@ pub struct BackupOptions {
 /// * If sending the message to the raw packer fails.
 /// * If the index file could not be serialized.
 /// * If the time is not in the range of `Local::now()`
+/// * If `opts.fail_on_read_error` is set and the backup cannot read an entry. Then the backup writes no snapshot file.
 ///
 /// # Returns
 ///
@@ -284,7 +301,14 @@ where
 
     let be = DryRunBackend::new(repo.dbe().clone(), opts.dry_run);
     info!("starting to backup {backup_paths:?} ...");
-    let archiver = Archiver::new(be, index, repo.config(), parent, snap)?;
+    let archiver = Archiver::new(
+        be,
+        index,
+        repo.config(),
+        parent,
+        snap,
+        opts.fail_on_read_error,
+    )?;
     let p = repo.progress_bytes("backing up...");
 
     archiver.archive(
@@ -317,6 +341,7 @@ where
 /// * If sending the message to the raw packer fails.
 /// * If the index file could not be serialized.
 /// * If the time is not in the range of `Local::now()`
+/// * If `opts.fail_on_read_error` is set and the backup cannot read an entry. Then the backup writes no snapshot file.
 ///
 /// # Returns
 ///
