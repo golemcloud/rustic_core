@@ -83,6 +83,12 @@ fn restore_default_reader_threads() -> TestResult<()> {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn restore_directory_metadata_after_entries() -> TestResult<()> {
+    scenarios::restore_directory_metadata_after_entries()
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn backup_unreadable_file() -> TestResult<()> {
     scenarios::backup_unreadable_file()
 }

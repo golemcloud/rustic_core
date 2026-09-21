@@ -19,7 +19,12 @@ use std::{
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 #[cfg(target_os = "linux")]
-use std::{ffi::OsStr, os::unix::fs::symlink, time::SystemTime};
+use std::{
+    ffi::OsStr,
+    fs::{File, FileTimes},
+    os::unix::fs::symlink,
+    time::SystemTime,
+};
 
 #[cfg(target_os = "linux")]
 use rustic_core::{
@@ -85,6 +90,11 @@ pub const SCENARIOS: &[Scenario] = &[
     (
         "restore-default-reader-threads",
         restore_default_reader_threads,
+    ),
+    #[cfg(target_os = "linux")]
+    (
+        "restore-directory-metadata-after-entries",
+        restore_directory_metadata_after_entries,
     ),
     #[cfg(target_os = "linux")]
     ("restore-full-volume", restore_full_volume),
@@ -665,6 +675,58 @@ pub fn restore_default_reader_threads() -> TestResult<()> {
     if !(MINIMUM..=DEFAULT_READER_THREADS).contains(&readers) || most > DEFAULT_READER_THREADS {
         return Err(format!(
             "{readers} threads read packs, and {most} reads overlapped. The default needs at least {MINIMUM} and at most {DEFAULT_READER_THREADS} threads."
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// A restore sets the metadata of a directory after it restores the entries of the directory.
+///
+/// The directory `d` holds the symlink `d/l` and has an old modification time.
+/// The restore creates the symlink in its metadata step, and the creation changes the modification
+/// time of `d`. Thus `d` has the saved modification time only if the restore sets the times of `d`
+/// after it creates `d/l`.
+///
+/// # Errors
+///
+/// * If the backup or the restore fails.
+/// * If the restored `d/l` is not a symlink with the saved target.
+/// * If the restored `d` does not have the saved modification time.
+#[cfg(target_os = "linux")]
+pub fn restore_directory_metadata_after_entries() -> TestResult<()> {
+    let source = tempdir()?;
+    let dir: Box<Path> = source.path().join("d").into_boxed_path();
+    fs::create_dir(&dir)?;
+    symlink("target", dir.join("l"))?;
+    File::open(&dir)?.set_times(
+        FileTimes::new().set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000_000)),
+    )?;
+    let saved_mtime = fs::symlink_metadata(&dir)?.modified()?;
+
+    let backend = fault_injection_backend();
+    let (repo, snap) = backup(init_repo(&backend)?, source.path(), "data")?;
+    let saved = SavedRepo {
+        backend,
+        repo: repo.to_indexed()?,
+        snap,
+    };
+    let dest = tempdir()?;
+    restore_with(&saved, dest.path(), &RestoreOptions::default(), |_| Ok(()))??;
+
+    let restored: Box<Path> = dest.path().join("data").join("d").into_boxed_path();
+    let target = fs::read_link(restored.join("l"))?;
+    if target != Path::new("target") {
+        return Err(format!(
+            "The restored symlink `d/l` points to `{}`. The saved target is `target`.",
+            target.display()
+        )
+        .into());
+    }
+    let restored_mtime = fs::symlink_metadata(&restored)?.modified()?;
+    if restored_mtime != saved_mtime {
+        return Err(format!(
+            "The restored directory `d` has the modification time {restored_mtime:?}. The saved time is {saved_mtime:?}."
         )
         .into());
     }
