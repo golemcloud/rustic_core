@@ -4,10 +4,17 @@
 //! A panic in a thread that no test joins does not fail a test.
 //! Thus the scenarios for such threads count the panics of these threads.
 //! The binary of this crate runs the same scenarios in child processes, and the `panic-abort` profile builds that binary with `panic = "abort"`.
-//! The binary also runs the scenario for a full volume, which needs a process that has one thread.
+//! Only the binary runs the scenarios `restore-full-volume` and `property-full-volume`, because they need a process that has one thread.
+//! The property tests here run fewer cases than the property scenarios of the binary, and check the same coverage.
 
+#[cfg(target_os = "linux")]
+use rustic_fault_tests::property;
 use rustic_fault_tests::scenarios;
 use rustic_testing::TestResult;
+
+/// The number of cases of each property test in the test harness.
+#[cfg(target_os = "linux")]
+const PROPERTY_CASES: usize = 32;
 
 #[test]
 fn restore_without_faults() -> TestResult<()> {
@@ -142,4 +149,16 @@ fn prune_tree_read() -> TestResult<()> {
 #[test]
 fn prune_stops_after_first_error() -> TestResult<()> {
     scenarios::prune_stops_after_first_error()
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn property_no_cache() -> TestResult<()> {
+    property::run_cases(false, PROPERTY_CASES)
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn property_cache() -> TestResult<()> {
+    property::run_cases(true, PROPERTY_CASES)
 }

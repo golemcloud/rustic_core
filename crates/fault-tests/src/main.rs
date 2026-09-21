@@ -4,18 +4,27 @@
 //! Without arguments, the binary starts itself one time for each scenario, and checks the exit status of each child process.
 //! A scenario passes when its child process exits with the status 0.
 //! A panic stops the child process with the signal `SIGABRT`, and the scenario fails.
+//! A child process that runs longer than [`SCENARIO_TIMEOUT`] is stopped, and the scenario fails.
 //!
 //! With the arguments `--scenario <name>`, the binary runs one scenario in this process.
 //!
 //! Run all scenarios with `cargo run -p rustic_fault_tests --profile panic-abort`.
 
 use std::{
-    env, io,
+    env, io, iter,
     path::Path,
-    process::{Command, ExitCode, ExitStatus},
+    process::{Child, Command, ExitCode, ExitStatus},
+    thread,
+    time::{Duration, Instant},
 };
 
 use rustic_fault_tests::scenarios::SCENARIOS;
+
+/// The maximum time of one scenario. The binary stops a child process that runs longer.
+const SCENARIO_TIMEOUT: Duration = Duration::from_mins(20);
+
+/// The time between two checks of the status of a child process.
+const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 fn main() -> ExitCode {
     if !cfg!(panic = "abort") {
@@ -64,9 +73,12 @@ fn run_all() -> ExitCode {
     let failed = SCENARIOS
         .iter()
         .map(|(name, _)| {
-            let status = Command::new(&*exe).args(["--scenario", name]).status();
+            let status = Command::new(&*exe)
+                .args(["--scenario", name])
+                .spawn()
+                .and_then(|mut child| wait_with_timeout(&mut child));
             println!("{name}: {}", describe(&status));
-            status.is_ok_and(|status| status.success())
+            status.is_ok_and(|status| status.is_some_and(|status| status.success()))
         })
         .filter(|passed| !passed)
         .count();
@@ -79,11 +91,46 @@ fn run_all() -> ExitCode {
     }
 }
 
+/// Waits for `child` for at most [`SCENARIO_TIMEOUT`].
+///
+/// # Returns
+///
+/// The exit status of `child`, or `None` if `child` did not stop in time. Then this function stops `child`.
+///
+/// # Errors
+///
+/// * If the function cannot get the status of `child`, or cannot stop it.
+fn wait_with_timeout(child: &mut Child) -> io::Result<Option<ExitStatus>> {
+    let deadline = Instant::now() + SCENARIO_TIMEOUT;
+    let status = iter::repeat_with(|| {
+        let status = child.try_wait();
+        if matches!(status, Ok(None)) {
+            thread::sleep(POLL_INTERVAL);
+        }
+        status
+    })
+    .find_map(|status| match status {
+        Ok(None) if Instant::now() < deadline => None,
+        status => Some(status),
+    })
+    .unwrap_or(Ok(None))?;
+    if status.is_none() {
+        child.kill()?;
+        _ = child.wait()?;
+    }
+    Ok(status)
+}
+
 /// Describes the exit status of a child process.
-fn describe(status: &io::Result<ExitStatus>) -> Box<str> {
+fn describe(status: &io::Result<Option<ExitStatus>>) -> Box<str> {
     match status {
-        Ok(status) if status.success() => "passed".into(),
-        Ok(status) => format!("FAILED ({status})").into_boxed_str(),
+        Ok(Some(status)) if status.success() => "passed".into(),
+        Ok(Some(status)) => format!("FAILED ({status})").into_boxed_str(),
+        Ok(None) => format!(
+            "FAILED (the child process did not stop in {} seconds)",
+            SCENARIO_TIMEOUT.as_secs()
+        )
+        .into_boxed_str(),
         Err(err) => format!("FAILED (the child process did not start: {err})").into_boxed_str(),
     }
 }

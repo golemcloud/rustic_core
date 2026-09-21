@@ -117,6 +117,15 @@ pub const SCENARIOS: &[Scenario] = &[
         "metadata-errors-are-warnings-without-option",
         metadata_errors_are_warnings_without_option,
     ),
+    #[cfg(target_os = "linux")]
+    ("property-no-cache", crate::property::property_no_cache),
+    #[cfg(target_os = "linux")]
+    ("property-cache", crate::property::property_cache),
+    #[cfg(target_os = "linux")]
+    (
+        "property-full-volume",
+        crate::property::property_full_volume,
+    ),
     ("prune-tree-read", prune_tree_read),
     (
         "prune-stops-after-first-error",

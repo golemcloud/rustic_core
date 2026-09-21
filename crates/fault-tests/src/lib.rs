@@ -10,6 +10,8 @@
 
 pub mod fixtures;
 pub mod panics;
+#[cfg(target_os = "linux")]
+pub mod property;
 pub mod scenarios;
 #[cfg(target_os = "linux")]
 pub mod volume;
