@@ -115,10 +115,32 @@ pub mod in_memory_backend {
                 .attach_context("tpe", tpe.to_string())
                 .attach_context("id", id.to_string()));
             }
-            Ok(
-                self.map.read().unwrap()[tpe][id]
-                    .slice(offset as usize..(offset + length) as usize),
-            )
+            let data = self.map.read().unwrap()[tpe]
+                .get(id)
+                .cloned()
+                .ok_or_else(|| {
+                    RusticError::new(
+                        ErrorKind::Backend,
+                        "Element tpe: {tpe}, id: {id} does not exist in backend",
+                    )
+                    .attach_context("tpe", tpe.to_string())
+                    .attach_context("id", id.to_string())
+                })?;
+            let start = offset as usize;
+            let Some(end) = start
+                .checked_add(length as usize)
+                .filter(|end| *end <= data.len())
+            else {
+                return Err(RusticError::new(
+                    ErrorKind::Backend,
+                    "The file `{id}` has `{file_length}` bytes. The read needs `{length}` bytes at the offset `{offset}`.",
+                )
+                .attach_context("id", id.to_string())
+                .attach_context("file_length", data.len().to_string())
+                .attach_context("offset", offset.to_string())
+                .attach_context("length", length.to_string()));
+            };
+            Ok(data.slice(start..end))
         }
 
         fn warmup_path(&self, tpe: FileType, id: &Id) -> String {
@@ -179,6 +201,60 @@ pub mod in_memory_backend {
                 );
             }
             Ok(())
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use bytes::Bytes;
+        use rustic_core::{FileType, Id, ReadBackend, WriteBackend};
+
+        use super::InMemoryBackend;
+
+        /// Creates a backend with one pack file that holds `data`.
+        fn backend_with_pack(data: &'static [u8]) -> (InMemoryBackend, Id) {
+            let backend = InMemoryBackend::new();
+            let id = Id::random();
+            backend
+                .write_bytes(FileType::Pack, &id, false, Bytes::from_static(data).into())
+                .unwrap();
+            (backend, id)
+        }
+
+        #[test]
+        fn read_partial_gives_the_range() {
+            let (backend, id) = backend_with_pack(b"pack data");
+            assert_eq!(
+                backend
+                    .read_partial(FileType::Pack, &id, false, 5, 4)
+                    .unwrap(),
+                Bytes::from_static(b"data")
+            );
+        }
+
+        #[test]
+        fn read_partial_of_a_missing_file_fails() {
+            let (backend, _) = backend_with_pack(b"pack data");
+            assert!(
+                backend
+                    .read_partial(FileType::Pack, &Id::random(), false, 0, 4)
+                    .is_err()
+            );
+        }
+
+        #[test]
+        fn read_partial_after_the_end_of_the_file_fails() {
+            let (backend, id) = backend_with_pack(b"pack data");
+            assert!(
+                backend
+                    .read_partial(FileType::Pack, &id, false, 5, 5)
+                    .is_err()
+            );
+            assert!(
+                backend
+                    .read_partial(FileType::Pack, &id, false, u32::MAX, u32::MAX)
+                    .is_err()
+            );
         }
     }
 }
