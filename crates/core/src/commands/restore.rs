@@ -16,7 +16,7 @@ use crate::{
     backend::{
         FileType, ReadBackend,
         decrypt::DecryptReadBackend,
-        local_destination::LocalDestination,
+        local_destination::{LocalDestination, LocalDestinationResult},
         node::{Node, NodeType},
     },
     blob::{BlobLocation, BlobLocations},
@@ -63,6 +63,23 @@ pub struct RestoreOptions {
     /// Restore sparse files
     #[cfg_attr(feature = "clap", clap(long))]
     pub sparse: Option<SparseRestore>,
+
+    /// Fail the restore if it cannot set the metadata of an entry
+    ///
+    /// With this option, the restore returns an error if it cannot create a symlink or another special file.
+    /// It also returns an error if it cannot set the ownership, the permissions, the extended attributes or
+    /// the times of an entry. After the first such error, the restore stops. If this option is not set, the
+    /// restore logs a warning for each such error.
+    ///
+    /// Some extended attributes are only in the destination, not in the snapshot. If the restore cannot
+    /// remove such an attribute, it logs a warning, also with this option. An attribute that the restore
+    /// cannot remove is usually a label that the kernel owns. For example, the kernel refuses the removal of
+    /// `security.selinux` with `EACCES`, and each file that a program creates in the destination gets that
+    /// label. If the restore cannot find the ID of a user or group name, it uses the saved numeric ID, also
+    /// with this option. On Windows, the restore sets only the times. On OpenBSD, the restore does not set
+    /// extended attributes.
+    #[cfg_attr(feature = "clap", clap(long))]
+    pub fail_on_metadata_error: bool,
 }
 
 #[derive(Serialize, Default, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -373,6 +390,7 @@ pub(crate) fn collect_and_prepare<S: IndexedFull>(
 /// # Errors
 ///
 /// * If the restore failed.
+/// * If `opts.fail_on_metadata_error` is set and this function cannot set the metadata of an entry. Then this function stops at that entry.
 fn restore_metadata(
     mut node_streamer: impl Iterator<Item = RusticResult<(PathBuf, Node)>>,
     hardlink_candidates: &BTreeMap<HardlinkKey, PathBuf>,
@@ -410,18 +428,18 @@ fn restore_metadata(
                         break;
                     }
                     let (path, node) = dir_stack.pop().unwrap();
-                    set_metadata(dest, opts, &path, &node);
+                    set_metadata(dest, opts, &path, &node)?;
                 }
                 // push current path to the stack
                 dir_stack.push((path, node));
             }
-            _ => set_metadata(dest, opts, &path, &node),
+            _ => set_metadata(dest, opts, &path, &node)?,
         }
     }
 
     // empty dir stack and set metadata
     for (path, node) in dir_stack.into_iter().rev() {
-        set_metadata(dest, opts, &path, &node);
+        set_metadata(dest, opts, &path, &node)?;
     }
 
     Ok(())
@@ -449,37 +467,68 @@ fn hardlink_key(node: &Node) -> Option<HardlinkKey> {
 ///
 /// # Errors
 ///
-/// If the metadata could not be set.
-// TODO: Return a result here, introduce errors and get rid of logging.
+/// * If `opts.fail_on_metadata_error` is set and this function cannot set the metadata. Then this function returns the first error.
+///
+/// If `opts.fail_on_metadata_error` is not set, this function logs a warning for each error and returns `Ok`.
 pub(crate) fn set_metadata(
     dest: &LocalDestination,
     opts: RestoreOptions,
     path: &PathBuf,
     node: &Node,
-) {
+) -> RusticResult<()> {
     debug!("setting metadata for {}", path.display());
-    dest.create_special(path, node)
-        .unwrap_or_else(|_| warn!("restore {}: creating special file failed.", path.display()));
+    // Gives the error of `result` if `opts.fail_on_metadata_error` is set. Else logs `warning` and gives `Ok`.
+    let check = |result: LocalDestinationResult<()>,
+                 guidance: &'static str,
+                 warning: &str|
+     -> RusticResult<()> {
+        match result {
+            Ok(()) => Ok(()),
+            Err(err) if opts.fail_on_metadata_error => {
+                Err(
+                    RusticError::with_source(ErrorKind::InputOutput, guidance, err)
+                        .attach_context("path", path.display().to_string()),
+                )
+            }
+            Err(_) => {
+                warn!("restore {}: {warning}", path.display());
+                Ok(())
+            }
+        }
+    };
+    check(
+        dest.create_special(path, node),
+        "The restore cannot create the symlink or special file `{path}`.",
+        "creating special file failed.",
+    )?;
     match (opts.no_ownership, opts.numeric_id) {
         (true, _) => {}
-        (false, true) => dest
-            .set_uid_gid(path, &node.meta)
-            .unwrap_or_else(|_| warn!("restore {}: setting UID/GID failed.", path.display())),
-        (false, false) => dest
-            .set_user_group(path, &node.meta)
-            .unwrap_or_else(|_| warn!("restore {}: setting User/Group failed.", path.display())),
+        (false, true) => check(
+            dest.set_uid_gid(path, &node.meta),
+            "The restore cannot set the owner of `{path}`.",
+            "setting UID/GID failed.",
+        )?,
+        (false, false) => check(
+            dest.set_user_group(path, &node.meta),
+            "The restore cannot set the owner of `{path}`.",
+            "setting User/Group failed.",
+        )?,
     }
-    dest.set_permission(path, node)
-        .unwrap_or_else(|_| warn!("restore {}: chmod failed.", path.display()));
-    dest.set_extended_attributes(path, &node.meta.extended_attributes)
-        .unwrap_or_else(|_| {
-            warn!(
-                "restore {}: setting extended attributes failed.",
-                path.display()
-            );
-        });
-    dest.set_times(path, &node.meta)
-        .unwrap_or_else(|_| warn!("restore {}: setting file times failed.", path.display()));
+    check(
+        dest.set_permission(path, node),
+        "The restore cannot set the permissions of `{path}`.",
+        "chmod failed.",
+    )?;
+    check(
+        dest.set_extended_attributes(path, &node.meta.extended_attributes),
+        "The restore cannot set the extended attributes of `{path}`.",
+        "setting extended attributes failed.",
+    )?;
+    check(
+        dest.set_times(path, &node.meta),
+        "The restore cannot set the times of `{path}`.",
+        "setting file times failed.",
+    )
 }
 
 struct PackInfo {
