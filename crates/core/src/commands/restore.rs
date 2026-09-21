@@ -6,7 +6,7 @@ use log::{debug, error, info, trace, warn};
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 
-use std::{cmp::Ordering, collections::BTreeMap, path::PathBuf, sync::Mutex};
+use std::{cmp::Ordering, collections::BTreeMap, num::NonZeroUsize, path::PathBuf, sync::Mutex};
 
 use itertools::Itertools;
 use rayon::ThreadPoolBuilder;
@@ -26,7 +26,7 @@ use crate::{
 };
 
 pub(crate) mod constants {
-    /// The maximum number of reader threads to use for restoring.
+    /// The number of reader threads to use for restoring if the options do not set it.
     pub(crate) const MAX_READER_THREADS_NUM: usize = 20;
 }
 
@@ -80,6 +80,14 @@ pub struct RestoreOptions {
     /// extended attributes.
     #[cfg_attr(feature = "clap", clap(long))]
     pub fail_on_metadata_error: bool,
+
+    /// Number of threads that read packs and write the contents of files [default: 20]
+    ///
+    /// If this option is not set, the restore uses 20 threads. This option does not change the global thread
+    /// pool of rayon. Rustic uses that pool for other work, for example to read index files and snapshot
+    /// files.
+    #[cfg_attr(feature = "clap", clap(long, value_name = "NUM"))]
+    pub reader_threads: Option<NonZeroUsize>,
 }
 
 #[derive(Serialize, Default, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -155,7 +163,7 @@ pub(crate) fn restore_repository<S: IndexedTree>(
         file_infos.file_lengths,
         file_infos.r,
         file_infos.restore_size,
-        opts.sparse.unwrap_or_default(),
+        opts,
     )?;
 
     let p = repo.progress_spinner("setting metadata...");
@@ -570,6 +578,7 @@ impl PackInfo {
 /// * `repo` - The repository to restore.
 /// * `dest` - The destination to restore to.
 /// * `file_infos` - The restore information.
+/// * `opts` - The restore options. This function uses `sparse` and `reader_threads`.
 ///
 /// # Errors
 ///
@@ -590,9 +599,10 @@ fn restore_contents<S: Open>(
     file_lengths: Vec<u64>,
     restore_info: RestoreInfo,
     restore_size: u64,
-    sparse: SparseRestore,
+    opts: RestoreOptions,
 ) -> RusticResult<()> {
     let be = repo.dbe();
+    let sparse = opts.sparse.unwrap_or_default();
 
     // first create needed empty files, as they are not created later.
     for (i, size) in file_lengths.iter().enumerate() {
@@ -638,7 +648,9 @@ fn restore_contents<S: Open>(
         .coalesce(PackInfo::coalesce)
         .collect();
 
-    let threads = constants::MAX_READER_THREADS_NUM;
+    let threads = opts
+        .reader_threads
+        .map_or(constants::MAX_READER_THREADS_NUM, NonZeroUsize::get);
 
     let pool = ThreadPoolBuilder::new()
         .num_threads(threads)
