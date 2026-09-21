@@ -55,6 +55,86 @@ fn restore_stops_after_first_error() -> TestResult<()> {
 }
 
 #[test]
+fn restore_stops_after_first_error_with_one_thread() -> TestResult<()> {
+    scenarios::restore_stops_after_first_error_with_one_thread()
+}
+
+#[test]
+fn restore_write_stops_after_first_error() -> TestResult<()> {
+    scenarios::restore_write_stops_after_first_error()
+}
+
+#[test]
+fn restore_reader_threads() -> TestResult<()> {
+    scenarios::restore_reader_threads()
+}
+
+#[test]
+fn restore_default_reader_threads() -> TestResult<()> {
+    scenarios::restore_default_reader_threads()
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn backup_unreadable_file() -> TestResult<()> {
+    scenarios::backup_unreadable_file()
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn backup_unreadable_dir() -> TestResult<()> {
+    scenarios::backup_unreadable_dir()
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn backup_skips_unreadable_file_without_option() -> TestResult<()> {
+    scenarios::backup_skips_unreadable_file_without_option()
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn backup_stops_after_first_error() -> TestResult<()> {
+    scenarios::backup_stops_after_first_error()
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn metadata_symlink() -> TestResult<()> {
+    scenarios::metadata_symlink()
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn metadata_ownership() -> TestResult<()> {
+    scenarios::metadata_ownership()
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn metadata_permission() -> TestResult<()> {
+    scenarios::metadata_permission()
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn metadata_extended_attributes() -> TestResult<()> {
+    scenarios::metadata_extended_attributes()
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn metadata_times() -> TestResult<()> {
+    scenarios::metadata_times()
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn metadata_errors_are_warnings_without_option() -> TestResult<()> {
+    scenarios::metadata_errors_are_warnings_without_option()
+}
+
+#[test]
 fn prune_tree_read() -> TestResult<()> {
     scenarios::prune_tree_read()
 }

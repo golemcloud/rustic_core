@@ -3,14 +3,21 @@
 use std::{
     fs, iter,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
+
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 use rustic_core::{
     BackupOptions, ConfigOptions, Credentials, FileType, IndexedFullStatus, IndexedIdsStatus,
-    KeyOptions, LocalDestination, LsOptions, Open, OpenStatus, PathList, ReadBackend, Repository,
-    RepositoryBackends, RepositoryOptions, RestoreOptions, RestorePlan, RusticResult, WriteBackend,
-    repofile::{MasterKey, SnapshotFile},
+    KeyOptions, LocalDestination, LsOptions, NoProgressBars, Open, OpenStatus, PathList, Progress,
+    ProgressBars, ProgressType, ReadBackend, Repository, RepositoryBackends, RepositoryOptions,
+    RestoreOptions, RestorePlan, RusticProgress, RusticResult, WriteBackend,
+    repofile::{MasterKey, Node, SnapshotFile},
 };
 use rustic_testing::{
     TestResult,
@@ -46,8 +53,27 @@ pub fn init_repo_with_key(
     backend: &Arc<FaultInjectionBackend>,
     key: &MasterKey,
 ) -> TestResult<Repository<OpenStatus>> {
+    init_repo_with_progress(backend, key, NoProgressBars)
+}
+
+/// Creates a repository in `backend` that `key` opens, and that gives its progress to `progress`.
+///
+/// The repository uses no cache.
+///
+/// # Errors
+///
+/// * If the function cannot create the repository.
+pub fn init_repo_with_progress(
+    backend: &Arc<FaultInjectionBackend>,
+    key: &MasterKey,
+    progress: impl ProgressBars,
+) -> TestResult<Repository<OpenStatus>> {
     let backends = RepositoryBackends::new(backend.clone(), None);
-    let repo = Repository::new(&RepositoryOptions::default().no_cache(true), &backends)?;
+    let repo = Repository::new_with_progress(
+        &RepositoryOptions::default().no_cache(true),
+        &backends,
+        progress,
+    )?;
     Ok(repo.init(
         &Credentials::Masterkey(key.clone()),
         &KeyOptions::default(),
@@ -129,13 +155,31 @@ pub fn backup<S: Open>(
     source: &Path,
     as_path: &str,
 ) -> TestResult<(Repository<IndexedIdsStatus>, SnapshotFile)> {
-    let repo = repo.to_indexed_ids()?;
     let opts = BackupOptions::default().as_path(PathBuf::from(as_path));
+    let (repo, snap) = backup_with_options(repo, source, &opts)?;
+    Ok((repo, snap?))
+}
+
+/// Backs up the directory or file `source` into `repo` with the options `opts`.
+///
+/// # Returns
+///
+/// The repository with an index that contains the new data, and the result of the backup.
+///
+/// # Errors
+///
+/// * If the function cannot read the index.
+pub fn backup_with_options<S: Open>(
+    repo: Repository<S>,
+    source: &Path,
+    opts: &BackupOptions,
+) -> TestResult<(Repository<IndexedIdsStatus>, RusticResult<SnapshotFile>)> {
+    let repo = repo.to_indexed_ids()?;
     let snap = repo.backup(
-        &opts,
+        opts,
         &PathList::from_iter(Some(source.to_path_buf())),
         SnapshotFile::default(),
-    )?;
+    );
     Ok((repo, snap))
 }
 
@@ -190,6 +234,50 @@ pub fn save_files(files: &[(&str, &[u8])]) -> TestResult<SavedRepo> {
     let source = tempdir()?;
     write_files(source.path(), files)?;
     let (repo, snap) = backup(init_repo(&backend)?, source.path(), "data")?;
+    Ok(SavedRepo {
+        backend,
+        repo: repo.to_indexed()?,
+        snap,
+    })
+}
+
+/// Saves `count` files in a new repository, each file in its own pack.
+///
+/// The function backs up each file in its own backup, so each file is in its own pack.
+/// A last backup of all files, with the path `data`, adds no data, so its snapshot uses all packs.
+///
+/// # Arguments
+///
+/// * `count` - The number of files
+/// * `seed` - The seed of the content of the first file. Each next file uses the next seed.
+///
+/// # Errors
+///
+/// * If the function cannot write the files.
+/// * If the function cannot create the repository, or a backup fails.
+pub fn save_files_in_own_packs(count: u64, seed: u64) -> TestResult<SavedRepo> {
+    let backend = fault_injection_backend();
+    let source = tempdir()?;
+    let files: Box<[_]> = (0..count)
+        .map(|index| {
+            (
+                format!("f{index:02}").into_boxed_str(),
+                content(seed + index, 4_000),
+            )
+        })
+        .collect();
+    files
+        .iter()
+        .try_for_each(|(name, data)| write_files(source.path(), &[(name, data)]))?;
+
+    let repo = files.iter().try_fold(
+        init_repo(&backend)?.to_indexed_ids()?,
+        |repo, (name, _)| -> TestResult<_> {
+            let (repo, _) = backup(repo, &source.path().join(&**name), "single")?;
+            Ok(repo)
+        },
+    )?;
+    let (repo, snap) = backup(repo, source.path(), "data")?;
     Ok(SavedRepo {
         backend,
         repo: repo.to_indexed()?,
@@ -306,4 +394,113 @@ pub fn restore_with(
     let plan = saved.repo.prepare_restore(opts, ls.clone(), &dest, false)?;
     before_restore(&plan)?;
     Ok(saved.repo.restore(plan, opts, ls, &dest))
+}
+
+/// Restores only the metadata of `nodes` into the directory `dir`.
+///
+/// The restore uses an empty repository and an empty plan, so it writes no file contents.
+/// Thus a scenario can give nodes with values that a backup does not make.
+/// `nodes` holds `PathBuf` values, because the restore takes nodes with a `PathBuf`.
+///
+/// # Arguments
+///
+/// * `dir` - The destination directory
+/// * `opts` - The restore options
+/// * `nodes` - The path of each node relative to `dir`, and the node
+///
+/// # Returns
+///
+/// The result of the restore.
+///
+/// # Errors
+///
+/// * If the function cannot create the empty repository or the destination.
+pub fn restore_metadata(
+    dir: &Path,
+    opts: &RestoreOptions,
+    nodes: Box<[(PathBuf, Node)]>,
+) -> TestResult<RusticResult<()>> {
+    let repo = init_repo(&fault_injection_backend())?.to_indexed()?;
+    let dest = LocalDestination::new(
+        dir.to_str().ok_or("the directory path is not UTF-8")?,
+        true,
+        false,
+    )?;
+    Ok(repo.restore(
+        RestorePlan::default(),
+        opts,
+        nodes.into_iter().map(Ok),
+        &dest,
+    ))
+}
+
+/// Progress bars that count the bytes of each progress of the type [`ProgressType::Bytes`].
+///
+/// Each progress is hidden, so a backup does not scan the size of its source.
+#[derive(Clone, Debug, Default)]
+pub struct ByteCounter(Arc<AtomicU64>);
+
+impl ByteCounter {
+    /// Gives the number of bytes that the progress bars counted.
+    #[must_use]
+    pub fn bytes(&self) -> u64 {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
+impl ProgressBars for ByteCounter {
+    fn progress(&self, progress_type: ProgressType, _prefix: &str) -> Progress {
+        match progress_type {
+            ProgressType::Bytes => Progress::new(CountingProgress(Arc::clone(&self.0))),
+            ProgressType::Spinner | ProgressType::Counter => Progress::hidden(),
+        }
+    }
+}
+
+/// A hidden progress that adds each increment to a shared counter.
+#[derive(Debug)]
+struct CountingProgress(Arc<AtomicU64>);
+
+impl RusticProgress for CountingProgress {
+    fn is_hidden(&self) -> bool {
+        true
+    }
+
+    fn set_length(&self, _len: u64) {}
+
+    fn set_title(&self, _title: &str) {}
+
+    fn inc(&self, inc: u64) {
+        _ = self.0.fetch_add(inc, Ordering::SeqCst);
+    }
+
+    fn finish(&self) {}
+}
+
+/// Sets the permission bits of the file or directory `path` to `mode`.
+///
+/// # Errors
+///
+/// * If the function cannot set the permission bits.
+#[cfg(unix)]
+pub fn set_mode(path: &Path, mode: u32) -> TestResult<()> {
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
+    Ok(())
+}
+
+/// Checks that this process does not run as root.
+///
+/// Some scenarios need a file operation that fails for a user other than root.
+/// Root can do these operations, so such a scenario cannot show the error under root.
+///
+/// # Errors
+///
+/// * If this process runs as root.
+#[cfg(target_os = "linux")]
+pub fn require_non_root() -> TestResult<()> {
+    if nix::unistd::geteuid().is_root() {
+        Err("This scenario needs a user other than root. Root can do the file operation that the scenario makes fail.".into())
+    } else {
+        Ok(())
+    }
 }
