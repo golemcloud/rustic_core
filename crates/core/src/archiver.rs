@@ -3,6 +3,7 @@ pub(crate) mod parent;
 pub(crate) mod tree;
 pub(crate) mod tree_archiver;
 
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::thread::scope;
 
@@ -63,6 +64,9 @@ pub struct Archiver<'a, BE: DecryptFullBackend, I: ReadGlobalIndex> {
 
     /// Fail the backup on each error that makes it skip an entry, for example if it cannot read an entry.
     fail_on_read_error: bool,
+
+    /// The number of threads that read and chunk files. If it is `None`, pariter uses its default.
+    threads: Option<NonZeroUsize>,
 }
 
 impl<'a, BE: DecryptFullBackend, I: ReadGlobalIndex> Archiver<'a, BE, I> {
@@ -76,6 +80,7 @@ impl<'a, BE: DecryptFullBackend, I: ReadGlobalIndex> Archiver<'a, BE, I> {
     /// * `parent` - The parent snapshot to use.
     /// * `snap` - The `SnapshotFile` to write to.
     /// * `fail_on_read_error` - Fail the backup on each error that makes it skip an entry, for example if it cannot read an entry.
+    /// * `threads` - The number of threads of each parallel stage. If it is `None`, each stage uses the default of pariter.
     ///
     /// # Errors
     ///
@@ -88,13 +93,15 @@ impl<'a, BE: DecryptFullBackend, I: ReadGlobalIndex> Archiver<'a, BE, I> {
         parent: Parent,
         mut snap: SnapshotFile,
         fail_on_read_error: bool,
+        threads: Option<NonZeroUsize>,
     ) -> RusticResult<Self> {
         let indexer = Indexer::new(be.clone()).into_shared();
         let mut summary = snap.summary.take().unwrap_or_default();
         summary.backup_start = Zoned::now();
 
-        let file_archiver = FileArchiver::new(be.clone(), index, indexer.clone(), config)?;
-        let tree_archiver = TreeArchiver::new(be.clone(), index, indexer.clone(), config, summary)?;
+        let file_archiver = FileArchiver::new(be.clone(), index, indexer.clone(), config, threads)?;
+        let tree_archiver =
+            TreeArchiver::new(be.clone(), index, indexer.clone(), config, summary, threads)?;
 
         Ok(Self {
             file_archiver,
@@ -105,6 +112,7 @@ impl<'a, BE: DecryptFullBackend, I: ReadGlobalIndex> Archiver<'a, BE, I> {
             index,
             snap,
             fail_on_read_error,
+            threads,
         })
     }
 
@@ -131,6 +139,7 @@ impl<'a, BE: DecryptFullBackend, I: ReadGlobalIndex> Archiver<'a, BE, I> {
     /// * If the index file could not be serialized.
     /// * If the time is not in the range of `Local::now()`.
     /// * If `fail_on_read_error` is set and this function cannot read an entry. Then this function writes no snapshot file.
+    #[allow(clippy::too_many_lines)]
     pub fn archive<R>(
         mut self,
         src: &R,
@@ -146,6 +155,7 @@ impl<'a, BE: DecryptFullBackend, I: ReadGlobalIndex> Archiver<'a, BE, I> {
         <R as ReadSource>::Iter: Send,
     {
         let fail_on_read_error = self.fail_on_read_error;
+        let threads = self.threads;
         // Keeps the first error of an entry if `fail_on_read_error` is set.
         let first_error = FirstError::default();
 
@@ -218,7 +228,14 @@ impl<'a, BE: DecryptFullBackend, I: ReadGlobalIndex> Archiver<'a, BE, I> {
                 },
             )
             // archive files in parallel
-            .parallel_map_scoped(s, |item| self.file_archiver.process(item, p))
+            .parallel_map_scoped_custom(
+                s,
+                |builder| match threads {
+                    Some(threads) => builder.threads(threads.get()),
+                    None => builder,
+                },
+                |item| self.file_archiver.process(item, p),
+            )
             .readahead_scoped(s)
             .filter_map(|item| match item {
                 Ok(item) => Some(item),

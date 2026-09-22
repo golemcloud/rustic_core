@@ -3,7 +3,7 @@ use derive_setters::Setters;
 use itertools::Itertools;
 use log::info;
 
-use std::path::PathBuf;
+use std::{num::NonZeroUsize, path::PathBuf};
 
 use path_dedot::ParseDot;
 use serde_derive::{Deserialize, Serialize};
@@ -192,6 +192,21 @@ pub struct BackupOptions {
     #[cfg_attr(feature = "merge", merge(strategy = conflate::bool::overwrite_false))]
     pub fail_on_read_error: bool,
 
+    /// Number of threads of each parallel stage of the backup [default: number of CPU cores]
+    ///
+    /// A backup has three parallel stages. The first stage reads and chunks files. The second stage compresses
+    /// and encrypts data blobs. The third stage compresses and encrypts tree blobs. This option sets the number
+    /// of threads of each stage. Thus a backup runs at most three times this number of such threads. It also
+    /// runs a fixed number of other threads.
+    ///
+    /// If this option is not set, each stage uses `std::thread::available_parallelism`. This value follows the
+    /// number of CPU cores of the host, or the CPU quota of the cgroup. This option does not change the global
+    /// thread pool of rayon. The commands copy, prune, rewrite, repair snapshots and merge do not use
+    /// this option.
+    #[cfg_attr(feature = "clap", clap(long, value_name = "NUM"))]
+    #[cfg_attr(feature = "merge", merge(strategy = conflate::option::overwrite_none))]
+    pub threads: Option<NonZeroUsize>,
+
     #[cfg_attr(feature = "clap", clap(flatten))]
     #[serde(flatten)]
     /// Options how to use a parent snapshot
@@ -308,6 +323,7 @@ where
         parent,
         snap,
         opts.fail_on_read_error,
+        opts.threads,
     )?;
     let p = repo.progress_bytes("backing up...");
 

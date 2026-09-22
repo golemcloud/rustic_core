@@ -88,7 +88,13 @@ impl<'a, BE: DecryptFullBackend, I: ReadGlobalIndex> TreeModifier<'a, BE, I> {
         let indexer = Indexer::new(be.clone()).into_shared();
         let pack_sizer =
             PackSizer::from_config(config, BlobType::Tree, index.total_size(BlobType::Tree));
-        let packer = Packer::new(be.clone(), BlobType::Tree, indexer.clone(), pack_sizer)?;
+        let packer = Packer::new(
+            be.clone(),
+            BlobType::Tree,
+            indexer.clone(),
+            pack_sizer,
+            None,
+        )?;
 
         Ok(Self {
             be,

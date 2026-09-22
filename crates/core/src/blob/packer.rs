@@ -1,5 +1,5 @@
 use std::{
-    num::NonZeroU32,
+    num::{NonZeroU32, NonZeroUsize},
     sync::{Arc, RwLock},
     thread::scope,
     time::{Duration, SystemTime},
@@ -228,6 +228,7 @@ impl<BE: DecryptWriteBackend> Packer<BE> {
     /// * `indexer` - The indexer to write to.
     /// * `config` - The config file.
     /// * `total_size` - The total size of the pack file.
+    /// * `threads` - The number of threads that compress and encrypt blobs. If it is `None`, pariter uses its default.
     ///
     /// # Errors
     ///
@@ -239,6 +240,7 @@ impl<BE: DecryptWriteBackend> Packer<BE> {
         blob_type: BlobType,
         indexer: SharedIndexer<BE>,
         pack_sizer: PackSizer,
+        threads: Option<NonZeroUsize>,
     ) -> RusticResult<Self> {
         let raw_packer = Arc::new(RwLock::new(RawPacker::new(
             be.clone(),
@@ -265,10 +267,17 @@ impl<BE: DecryptWriteBackend> Packer<BE> {
                     .filter(|(_, id)| !indexer.read().unwrap().has(id))
                     .filter(|(_, id)| !raw_packer.read().unwrap().has(id))
                     .readahead_scoped(scope)
-                    .parallel_map_scoped(scope, |(data, id): (Bytes, BlobId)| {
-                        let (data, data_len, uncompressed_length) = be.process_data(&data)?;
-                        Ok((data, id, u64::from(data_len), uncompressed_length))
-                    })
+                    .parallel_map_scoped_custom(
+                        scope,
+                        |builder| match threads {
+                            Some(threads) => builder.threads(threads.get()),
+                            None => builder,
+                        },
+                        |(data, id): (Bytes, BlobId)| {
+                            let (data, data_len, uncompressed_length) = be.process_data(&data)?;
+                            Ok((data, id, u64::from(data_len), uncompressed_length))
+                        },
+                    )
                     .readahead_scoped(scope)
                     // check again if id is already contained
                     // TODO: We may still save duplicate blobs - the indexer is only updated when the packfile write has completed
@@ -948,7 +957,7 @@ impl<BE: DecryptFullBackend> BlobCopier<BE> {
         indexer: SharedIndexer<BE>,
         pack_sizer: PackSizer,
     ) -> RusticResult<Self> {
-        let packer = Packer::new(be_dst, blob_type, indexer, pack_sizer)?;
+        let packer = Packer::new(be_dst, blob_type, indexer, pack_sizer, None)?;
         Ok(Self {
             be_src,
             packer,

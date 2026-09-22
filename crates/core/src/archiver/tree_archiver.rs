@@ -1,4 +1,7 @@
-use std::path::{Path, PathBuf};
+use std::{
+    num::NonZeroUsize,
+    path::{Path, PathBuf},
+};
 
 use bytesize::ByteSize;
 use log::{debug, trace};
@@ -54,6 +57,7 @@ impl<'a, BE: DecryptWriteBackend, I: ReadGlobalIndex> TreeArchiver<'a, BE, I> {
     /// * `indexer` - The indexer to write to.
     /// * `config` - The config file.
     /// * `summary` - The summary of the snapshot.
+    /// * `threads` - The number of threads that compress and encrypt tree blobs. If it is `None`, pariter uses its default.
     ///
     /// # Errors
     ///
@@ -65,10 +69,11 @@ impl<'a, BE: DecryptWriteBackend, I: ReadGlobalIndex> TreeArchiver<'a, BE, I> {
         indexer: SharedIndexer<BE>,
         config: &ConfigFile,
         summary: SnapshotSummary,
+        threads: Option<NonZeroUsize>,
     ) -> RusticResult<Self> {
         let pack_sizer =
             PackSizer::from_config(config, BlobType::Tree, index.total_size(BlobType::Tree));
-        let tree_packer = Packer::new(be, BlobType::Tree, indexer, pack_sizer)?;
+        let tree_packer = Packer::new(be, BlobType::Tree, indexer, pack_sizer, threads)?;
 
         Ok(Self {
             tree: Tree::new(),

@@ -1,4 +1,4 @@
-use std::io::Read;
+use std::{io::Read, num::NonZeroUsize};
 
 use crate::{
     archiver::{
@@ -51,6 +51,7 @@ impl<'a, BE: DecryptWriteBackend, I: ReadGlobalIndex> FileArchiver<'a, BE, I> {
     /// * `index` - The index to read from.
     /// * `indexer` - The indexer to write to.
     /// * `config` - The config file.
+    /// * `threads` - The number of threads that compress and encrypt data blobs. If it is `None`, pariter uses its default.
     ///
     /// # Errors
     ///
@@ -61,10 +62,11 @@ impl<'a, BE: DecryptWriteBackend, I: ReadGlobalIndex> FileArchiver<'a, BE, I> {
         index: &'a I,
         indexer: SharedIndexer<BE>,
         config: &ConfigFile,
+        threads: Option<NonZeroUsize>,
     ) -> RusticResult<Self> {
         let pack_sizer =
             PackSizer::from_config(config, BlobType::Data, index.total_size(BlobType::Data));
-        let data_packer = Packer::new(be, BlobType::Data, indexer, pack_sizer)?;
+        let data_packer = Packer::new(be, BlobType::Data, indexer, pack_sizer, threads)?;
 
         Ok(Self {
             index,
