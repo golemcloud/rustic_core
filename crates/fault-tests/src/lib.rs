@@ -9,6 +9,7 @@
 //! Run all scenarios with `cargo run -p rustic_fault_tests --profile panic-abort`.
 
 pub mod fixtures;
+pub mod logging;
 pub mod panics;
 #[cfg(target_os = "linux")]
 pub mod property;

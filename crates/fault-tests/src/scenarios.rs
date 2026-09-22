@@ -45,10 +45,12 @@ use tempfile::tempdir;
 #[cfg(target_os = "linux")]
 use crate::{
     fixtures::{
-        ByteCounter, backup_with_options, init_repo_with_progress, require_non_root,
-        restore_metadata, set_mode,
+        ByteCounter, EXTENDED_ATTRIBUTE_VALUE, backup_with_options, expect_xattr,
+        init_repo_with_progress, require_non_root, require_xattr_refused, restore_metadata,
+        set_extended_attributes, set_mode,
     },
-    volume::{Tmpfs, enter_user_mount_namespace},
+    logging::{capture_warnings, warnings_containing},
+    volume::{Tmpfs, enter_nested_user_namespace, enter_user_mount_namespace},
 };
 use crate::{
     fixtures::{
@@ -122,6 +124,38 @@ pub const SCENARIOS: &[Scenario] = &[
     ("metadata-extended-attributes", metadata_extended_attributes),
     #[cfg(target_os = "linux")]
     ("metadata-times", metadata_times),
+    #[cfg(target_os = "linux")]
+    (
+        "metadata-kernel-extended-attributes",
+        metadata_kernel_extended_attributes,
+    ),
+    #[cfg(target_os = "linux")]
+    (
+        "metadata-privileged-extended-attributes",
+        metadata_privileged_extended_attributes,
+    ),
+    #[cfg(target_os = "linux")]
+    (
+        "metadata-system-namespace-extended-attributes",
+        metadata_system_namespace_extended_attributes,
+    ),
+    #[cfg(target_os = "linux")]
+    (
+        "metadata-namespace-prefix-extended-attributes",
+        metadata_namespace_prefix_extended_attributes,
+    ),
+    #[cfg(target_os = "linux")]
+    (
+        "metadata-replaces-extended-attributes",
+        metadata_replaces_extended_attributes,
+    ),
+    #[cfg(target_os = "linux")]
+    (
+        "metadata-kernel-attribute-warns-once",
+        metadata_kernel_attribute_warns_once,
+    ),
+    #[cfg(target_os = "linux")]
+    ("metadata-selinux-label", metadata_selinux_label),
     #[cfg(target_os = "linux")]
     (
         "metadata-errors-are-warnings-without-option",
@@ -1159,12 +1193,64 @@ impl MetadataCase {
     ///
     /// * If the function cannot write the file.
     fn extended_attributes() -> TestResult<Self> {
+        Self::extended_attribute_case("golem")
+    }
+
+    /// A case that cannot set an extended attribute of a namespace that needs privilege.
+    ///
+    /// The node has an extended attribute of the namespace `trusted.`, which needs `CAP_SYS_ADMIN` in the
+    /// initial user namespace. The kernel refuses that set with the same error as a set of an attribute that
+    /// it owns, so the case shows that the rule of the restore follows the namespace and not the error.
+    ///
+    /// # Errors
+    ///
+    /// * If the function cannot write the file.
+    fn privileged_extended_attributes() -> TestResult<Self> {
+        Self::extended_attribute_case("trusted.rustic")
+    }
+
+    /// A case that cannot set an extended attribute of the namespace `system.`.
+    ///
+    /// The namespace `system.` is not in the rule of the restore, although the kernel uses it. A POSIX ACL
+    /// lives there, under the names `system.posix_acl_access` and `system.posix_acl_default`, and the owner of
+    /// a file sets an ACL without privilege. An ACL is part of the filesystem that the agent had, so a failed
+    /// set of one must stay an error. The node of this case has a `system.` name that the filesystem does not
+    /// implement, which every user, also root, cannot set.
+    ///
+    /// # Errors
+    ///
+    /// * If the function cannot write the file.
+    fn system_namespace_extended_attributes() -> TestResult<Self> {
+        Self::extended_attribute_case("system.rustic")
+    }
+
+    /// A case that cannot set an extended attribute whose name is the kernel namespace without its point.
+    ///
+    /// The name `security` has no namespace, and Linux refuses such a name. The case shows the boundary of
+    /// the rule of the restore: the rule covers the namespace `security.`, and not each name that starts with
+    /// the letters of that namespace.
+    ///
+    /// # Errors
+    ///
+    /// * If the function cannot write the file.
+    fn namespace_prefix_extended_attributes() -> TestResult<Self> {
+        Self::extended_attribute_case("security")
+    }
+
+    /// A case whose node has the extended attribute `name`, which the kernel refuses to set.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - The name of the extended attribute of the node
+    ///
+    /// # Errors
+    ///
+    /// * If the function cannot write the file or build the extended attribute.
+    fn extended_attribute_case(name: &str) -> TestResult<Self> {
         let dir = tempdir()?;
         write_files(dir.path(), &[("a", b"data")])?;
         let mut node = file_node("a");
-        // The type of extended attributes is not public, so the case sets them from their serialized form.
-        node.meta.extended_attributes =
-            serde_json::from_str(r#"[{"name":"golem","value":"eA=="}]"#)?;
+        set_extended_attributes(&mut node, &[name])?;
         Ok(Self {
             dest: Destination::Temporary(dir),
             opts: RestoreOptions::default().no_ownership(true),
@@ -1300,6 +1386,276 @@ pub fn metadata_times() -> TestResult<()> {
     expect_metadata_error(&MetadataCase::times()?)
 }
 
+/// The name of the extended attribute that the kernel owns in the scenarios of the rule.
+///
+/// No security module claims the name, so a set of it needs `CAP_SYS_ADMIN` on each kernel, also on a kernel
+/// that lets the owner of a file set `security.selinux`.
+#[cfg(target_os = "linux")]
+const KERNEL_XATTR_NAME: &str = "security.rustic_skip";
+
+/// The name of the extended attribute that the restore must set on the file of the kernel-owned attribute.
+#[cfg(target_os = "linux")]
+const USER_XATTR_NAME: &str = "user.rustic_kept";
+
+/// The name of the extended attribute that each file of [`metadata_kernel_attribute_warns_once`] has.
+///
+/// No other scenario uses this name, so the count of the warnings that name it holds for a test harness that
+/// runs the scenarios at the same time.
+#[cfg(target_os = "linux")]
+const ONCE_XATTR_NAME: &str = "security.rustic_once";
+
+/// The name of the second extended attribute that the last file of that scenario has.
+///
+/// The kernel owns this name too. A restore that keeps only the fact that it already wrote a warning would
+/// skip this name without a line, and thus lose the report of a second kernel-owned attribute, for example a
+/// file capability after a label.
+#[cfg(target_os = "linux")]
+const SECOND_XATTR_NAME: &str = "security.rustic_second";
+
+/// The name of the label of a volume that is mounted with `seclabel`.
+#[cfg(target_os = "linux")]
+const SELINUX_XATTR_NAME: &str = "security.selinux";
+
+/// The value that [`metadata_selinux_label`] gives to the label of the destination file.
+#[cfg(target_os = "linux")]
+const SELINUX_LABEL: &[u8] = b"system_u:object_r:container_file_t:s0\0";
+
+/// The number of files of [`metadata_kernel_attribute_warns_once`].
+#[cfg(target_os = "linux")]
+const WARN_ONCE_FILES: usize = 10_000;
+
+/// Restores a file whose node has an extended attribute that the kernel owns, and one of the namespace `user.`.
+///
+/// The destination has the file without extended attributes, so the restore sets both attributes. The kernel
+/// refuses the set of the attribute that it owns. The restore must keep the file without that attribute, set
+/// the attribute of the namespace `user.`, and give `Ok`.
+///
+/// # Arguments
+///
+/// * `fail_on_metadata_error` - The value of the option of the restore
+///
+/// # Errors
+///
+/// * If the kernel lets this process set the attribute that the kernel owns.
+/// * If the restore fails.
+/// * If the destination file has the attribute that the kernel owns, or does not have the other attribute.
+#[cfg(target_os = "linux")]
+fn restore_kernel_extended_attributes(fail_on_metadata_error: bool) -> TestResult<()> {
+    let dir = tempdir()?;
+    write_files(dir.path(), &[("a", b"data")])?;
+    let path = dir.path().join("a");
+    require_xattr_refused(&path, KERNEL_XATTR_NAME)?;
+
+    let mut node = file_node("a");
+    set_extended_attributes(&mut node, &[KERNEL_XATTR_NAME, USER_XATTR_NAME])?;
+    let opts = RestoreOptions::default()
+        .no_ownership(true)
+        .fail_on_metadata_error(fail_on_metadata_error);
+    restore_metadata(dir.path(), &opts, Box::new([(PathBuf::from("a"), node)]))??;
+
+    expect_xattr(&path, KERNEL_XATTR_NAME, None)?;
+    expect_xattr(&path, USER_XATTR_NAME, Some(EXTENDED_ATTRIBUTE_VALUE))
+}
+
+/// A restore that returns metadata errors gives `Ok` when it cannot set an attribute that the kernel owns.
+///
+/// [`restore_kernel_extended_attributes`] describes the case.
+///
+/// The destination file of the case does not have the attribute, so the scenario covers the set that follows
+/// the listing. The other set, which replaces the value of an attribute that the destination file already
+/// has, needs a kernel-owned attribute on that file, and only a process with privileges can give it. So only
+/// [`metadata_selinux_label`], which the binary of this crate runs, covers that set with a kernel-owned
+/// attribute. [`metadata_replaces_extended_attributes`] covers it with an attribute of the namespace `user.`.
+///
+/// # Errors
+///
+/// * If this process runs as root.
+/// * If the restore does not give `Ok`, or does not set the other attribute of the file.
+#[cfg(target_os = "linux")]
+pub fn metadata_kernel_extended_attributes() -> TestResult<()> {
+    require_non_root()?;
+    restore_kernel_extended_attributes(true)
+}
+
+/// A restore that returns metadata errors fails when it cannot set an attribute of a privileged namespace.
+///
+/// [`MetadataCase::privileged_extended_attributes`] describes the case.
+///
+/// # Errors
+///
+/// * If this process runs as root.
+/// * If the restore does not return the error for the extended attributes.
+#[cfg(target_os = "linux")]
+pub fn metadata_privileged_extended_attributes() -> TestResult<()> {
+    require_non_root()?;
+    expect_metadata_error(&MetadataCase::privileged_extended_attributes()?)
+}
+
+/// A restore that returns metadata errors fails when it cannot set an attribute of the namespace `system.`.
+///
+/// [`MetadataCase::system_namespace_extended_attributes`] describes the case.
+///
+/// # Errors
+///
+/// * If the restore does not return the error for the extended attributes.
+#[cfg(target_os = "linux")]
+pub fn metadata_system_namespace_extended_attributes() -> TestResult<()> {
+    expect_metadata_error(&MetadataCase::system_namespace_extended_attributes()?)
+}
+
+/// A restore that returns metadata errors fails when it cannot set the attribute `security`.
+///
+/// [`MetadataCase::namespace_prefix_extended_attributes`] describes the case.
+///
+/// # Errors
+///
+/// * If the restore does not return the error for the extended attributes.
+#[cfg(target_os = "linux")]
+pub fn metadata_namespace_prefix_extended_attributes() -> TestResult<()> {
+    expect_metadata_error(&MetadataCase::namespace_prefix_extended_attributes()?)
+}
+
+/// A restore replaces the value of an extended attribute that the destination file already has.
+///
+/// The destination file has the attribute of the namespace `user.` with another value, so the restore lists
+/// the attributes of the file, reads the value, sees the difference, and sets the value of the node. This is
+/// the path that a restore takes on a file that already has the attribute of the node, and it is the path
+/// that fails on a volume that is mounted with `seclabel`.
+///
+/// # Errors
+///
+/// * If the restore fails, or does not replace the value.
+#[cfg(target_os = "linux")]
+pub fn metadata_replaces_extended_attributes() -> TestResult<()> {
+    let dir = tempdir()?;
+    write_files(dir.path(), &[("a", b"data")])?;
+    let path = dir.path().join("a");
+    xattr::set(&path, USER_XATTR_NAME, b"old")?;
+
+    let mut node = file_node("a");
+    set_extended_attributes(&mut node, &[USER_XATTR_NAME])?;
+    let opts = RestoreOptions::default()
+        .no_ownership(true)
+        .fail_on_metadata_error(true);
+    restore_metadata(dir.path(), &opts, Box::new([(PathBuf::from("a"), node)]))??;
+
+    expect_xattr(&path, USER_XATTR_NAME, Some(EXTENDED_ATTRIBUTE_VALUE))
+}
+
+/// A restore of 10,000 files writes one warning for each attribute name that the kernel owns.
+///
+/// Each file of the destination gets the same extended attribute that the kernel owns, and the last file gets
+/// a second such attribute. One warning for each file hides everything else in the log of an executor, so the
+/// restore must write one warning for each name, and each warning must name its attribute. The second name
+/// shows that the restore reports each name: a restore that only keeps whether it already wrote a warning
+/// would skip the second name without a line.
+///
+/// # Errors
+///
+/// * If this process runs as root.
+/// * If the process cannot keep its warnings.
+/// * If the kernel lets this process set the attribute that the kernel owns.
+/// * If the restore fails.
+/// * If the number of warnings that name an attribute is not 1.
+#[cfg(target_os = "linux")]
+pub fn metadata_kernel_attribute_warns_once() -> TestResult<()> {
+    require_non_root()?;
+    capture_warnings()?;
+
+    let dir = tempdir()?;
+    let names: Box<[Box<str>]> = (0..WARN_ONCE_FILES)
+        .map(|index| format!("f{index:05}").into_boxed_str())
+        .collect();
+    let files: Box<[(&str, &[u8])]> = names
+        .iter()
+        .map(|name| (&**name, b"data".as_slice()))
+        .collect();
+    write_files(dir.path(), &files)?;
+    require_xattr_refused(&dir.path().join(&*names[0]), ONCE_XATTR_NAME)?;
+
+    let last = WARN_ONCE_FILES - 1;
+    let nodes: Box<[(PathBuf, Node)]> = names
+        .iter()
+        .enumerate()
+        .map(|(index, name)| {
+            let mut node = file_node(name);
+            if index == last {
+                set_extended_attributes(&mut node, &[ONCE_XATTR_NAME, SECOND_XATTR_NAME])?;
+            } else {
+                set_extended_attributes(&mut node, &[ONCE_XATTR_NAME])?;
+            }
+            Ok((PathBuf::from(&**name), node))
+        })
+        .collect::<TestResult<_>>()?;
+    let opts = RestoreOptions::default()
+        .no_ownership(true)
+        .fail_on_metadata_error(true);
+    restore_metadata(dir.path(), &opts, nodes)??;
+
+    [ONCE_XATTR_NAME, SECOND_XATTR_NAME]
+        .iter()
+        .try_for_each(|name| -> TestResult<()> {
+            let warnings = warnings_containing(name);
+            if warnings == 1 {
+                Ok(())
+            } else {
+                Err(format!(
+                    "The restore of {WARN_ONCE_FILES} files wrote {warnings} warnings that name `{name}`, but one was expected."
+                )
+                .into())
+            }
+        })
+}
+
+/// A restore that returns metadata errors gives `Ok` when it cannot set the label of the destination file.
+///
+/// The scenario builds the case of the cluster. A volume that is mounted with `seclabel` gives each file the
+/// label `security.selinux`, a backup records the label, and the restore then lists the attributes of the
+/// destination file, reads its label, and sets the label of the snapshot, because the values differ. A pod
+/// that runs without privileges cannot set that label, so the kernel refuses the call.
+///
+/// The process builds the same case without privileges. It mounts a tmpfs in its own user namespace, where it
+/// can give the label to the destination file, and then it moves into a nested user namespace, which removes
+/// its privileges over that tmpfs. The listing and the read of the label still work, the set fails, and the
+/// process can still write the file and set its other extended attributes.
+///
+/// The nested user namespace also removes the privilege to unmount, so the scenario cannot unmount the tmpfs
+/// and leaves its empty mount point in the directory for temporary files. The tmpfs itself stops with the
+/// process. The scenario does not use a mount point of its own name, because two runs of the binary would
+/// then use the same path.
+///
+/// Only the binary of this crate runs this scenario, because a new user namespace needs a process that has
+/// one thread.
+///
+/// # Errors
+///
+/// * If the process cannot enter the namespaces, mount the tmpfs or give the label to the file.
+/// * If the kernel lets this process set the label after the nested namespace.
+/// * If the restore fails.
+/// * If the label of the file changed, or the file does not have the other attribute.
+#[cfg(target_os = "linux")]
+pub fn metadata_selinux_label() -> TestResult<()> {
+    enter_user_mount_namespace()?;
+    let mount_dir = tempdir()?;
+    let volume = Tmpfs::mount(mount_dir.path(), 1_000_000)?;
+    write_files(volume.path(), &[("a", b"data")])?;
+    let path = volume.path().join("a");
+    xattr::set(&path, SELINUX_XATTR_NAME, SELINUX_LABEL)?;
+
+    enter_nested_user_namespace()?;
+    require_xattr_refused(&path, SELINUX_XATTR_NAME)?;
+
+    let mut node = file_node("a");
+    set_extended_attributes(&mut node, &[SELINUX_XATTR_NAME, USER_XATTR_NAME])?;
+    let opts = RestoreOptions::default()
+        .no_ownership(true)
+        .fail_on_metadata_error(true);
+    restore_metadata(volume.path(), &opts, Box::new([(PathBuf::from("a"), node)]))??;
+
+    expect_xattr(&path, SELINUX_XATTR_NAME, Some(SELINUX_LABEL))?;
+    expect_xattr(&path, USER_XATTR_NAME, Some(EXTENDED_ATTRIBUTE_VALUE))
+}
+
 /// A restore that does not return metadata errors succeeds when it cannot set metadata.
 ///
 /// The scenario runs the cases of the other metadata scenarios without the option.
@@ -1314,10 +1670,14 @@ pub fn metadata_errors_are_warnings_without_option() -> TestResult<()> {
     require_non_root()?;
     let (saved, dir) = symlink_case()?;
     restore_with(&saved, dir.path(), &RestoreOptions::default(), |_| Ok(()))??;
+    restore_kernel_extended_attributes(false)?;
     [
         MetadataCase::ownership()?,
         MetadataCase::permission()?,
         MetadataCase::extended_attributes()?,
+        MetadataCase::privileged_extended_attributes()?,
+        MetadataCase::system_namespace_extended_attributes()?,
+        MetadataCase::namespace_prefix_extended_attributes()?,
         MetadataCase::times()?,
     ]
     .iter()

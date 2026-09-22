@@ -4,7 +4,7 @@
 //! A panic in a thread that no test joins does not fail a test.
 //! Thus the scenarios for such threads count the panics of these threads.
 //! The binary of this crate runs the same scenarios in child processes, and the `panic-abort` profile builds that binary with `panic = "abort"`.
-//! Only the binary runs the scenarios `restore-full-volume` and `property-full-volume`, because they need a process that has one thread.
+//! Only the binary runs the scenarios `restore-full-volume`, `property-full-volume` and `metadata-selinux-label`, because they need a process that has one thread.
 //! The property tests here run fewer cases than the property scenarios of the binary, and check the same coverage.
 
 #[cfg(target_os = "linux")]
@@ -139,6 +139,42 @@ fn metadata_extended_attributes() -> TestResult<()> {
 #[test]
 fn metadata_times() -> TestResult<()> {
     scenarios::metadata_times()
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn metadata_kernel_extended_attributes() -> TestResult<()> {
+    scenarios::metadata_kernel_extended_attributes()
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn metadata_privileged_extended_attributes() -> TestResult<()> {
+    scenarios::metadata_privileged_extended_attributes()
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn metadata_system_namespace_extended_attributes() -> TestResult<()> {
+    scenarios::metadata_system_namespace_extended_attributes()
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn metadata_namespace_prefix_extended_attributes() -> TestResult<()> {
+    scenarios::metadata_namespace_prefix_extended_attributes()
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn metadata_replaces_extended_attributes() -> TestResult<()> {
+    scenarios::metadata_replaces_extended_attributes()
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn metadata_kernel_attribute_warns_once() -> TestResult<()> {
+    scenarios::metadata_kernel_attribute_warns_once()
 }
 
 #[cfg(target_os = "linux")]

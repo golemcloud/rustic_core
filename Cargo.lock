@@ -4362,11 +4362,13 @@ dependencies = [
 name = "rustic_fault_tests"
 version = "0.1.0"
 dependencies = [
+ "log",
  "nix",
  "rustic_core",
  "rustic_testing",
  "serde_json",
  "tempfile",
+ "xattr",
 ]
 
 [[package]]

@@ -488,6 +488,87 @@ pub fn set_mode(path: &Path, mode: u32) -> TestResult<()> {
     Ok(())
 }
 
+/// Sets the extended attributes with the names `names` of `node`, each with the value `x`.
+///
+/// The type of the extended attributes of a node is not public, so the function builds them from their
+/// serialized form. `eA==` is the value `x` in base 64.
+///
+/// # Arguments
+///
+/// * `node` - The node to set the extended attributes of
+/// * `names` - The name of each extended attribute
+///
+/// # Errors
+///
+/// * If the function cannot build the extended attributes.
+#[cfg(target_os = "linux")]
+pub fn set_extended_attributes(node: &mut Node, names: &[&str]) -> TestResult<()> {
+    let attributes: Box<[Box<str>]> = names
+        .iter()
+        .map(|name| format!(r#"{{"name":"{name}","value":"eA=="}}"#).into_boxed_str())
+        .collect();
+    node.meta.extended_attributes = serde_json::from_str(&format!("[{}]", attributes.join(",")))?;
+    Ok(())
+}
+
+/// The value that [`set_extended_attributes`] gives to each extended attribute.
+#[cfg(target_os = "linux")]
+pub const EXTENDED_ATTRIBUTE_VALUE: &[u8] = b"x";
+
+/// Checks that the extended attribute `name` of the file `path` has the value `value`.
+///
+/// # Arguments
+///
+/// * `path` - The file to read the extended attribute of
+/// * `name` - The name of the extended attribute
+/// * `value` - The expected value, or `None` if the file must not have the attribute
+///
+/// # Errors
+///
+/// * If the function cannot read the extended attribute.
+/// * If the value of the extended attribute is not `value`.
+#[cfg(target_os = "linux")]
+pub fn expect_xattr(path: &Path, name: &str, value: Option<&[u8]>) -> TestResult<()> {
+    let found = xattr::get(path, name)?;
+    if found.as_deref() == value {
+        Ok(())
+    } else {
+        Err(format!(
+            "The extended attribute `{name}` of `{}` is {found:?}, but {value:?} was expected.",
+            path.display()
+        )
+        .into())
+    }
+}
+
+/// Checks that the kernel refuses a set of the extended attribute `name` on the file `path` to this process.
+///
+/// A scenario of a failed set needs a set that the kernel refuses. A kernel that permits the set would make
+/// the scenario give `Ok` without showing anything, so the scenario stops instead.
+///
+/// The function does not remove the attribute when the set succeeds, because the scenario then stops.
+///
+/// # Arguments
+///
+/// * `path` - The file to set the extended attribute on
+/// * `name` - The name of the extended attribute
+///
+/// # Errors
+///
+/// * If the kernel permits the set.
+#[cfg(target_os = "linux")]
+pub fn require_xattr_refused(path: &Path, name: &str) -> TestResult<()> {
+    if xattr::set(path, name, b"refused").is_err() {
+        Ok(())
+    } else {
+        Err(format!(
+            "This kernel lets this process set the extended attribute `{name}` on `{}`. The scenario cannot show the rule for an attribute that the kernel refuses.",
+            path.display()
+        )
+        .into())
+    }
+}
+
 /// Checks that this process does not run as root.
 ///
 /// Some scenarios need a file operation that fails for a user other than root.
