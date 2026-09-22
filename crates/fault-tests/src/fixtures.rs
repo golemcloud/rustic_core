@@ -1,12 +1,17 @@
 //! Repositories, source trees and checks for the fault scenarios.
 
 use std::{
-    fs, iter,
+    ffi::OsStr,
+    fs,
+    io::{self, Cursor, Read},
+    iter,
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
+    thread,
+    time::Duration,
 };
 
 #[cfg(unix)]
@@ -15,9 +20,10 @@ use std::os::unix::fs::PermissionsExt;
 use rustic_core::{
     BackupOptions, ConfigOptions, Credentials, FileType, IndexedFullStatus, IndexedIdsStatus,
     KeyOptions, LocalDestination, LsOptions, NoProgressBars, Open, OpenStatus, PathList, Progress,
-    ProgressBars, ProgressType, ReadBackend, Repository, RepositoryBackends, RepositoryOptions,
-    RestoreOptions, RestorePlan, RusticProgress, RusticResult, WriteBackend,
-    repofile::{MasterKey, Node, SnapshotFile},
+    ProgressBars, ProgressType, ReadBackend, ReadSource, ReadSourceEntry, ReadSourceOpen,
+    Repository, RepositoryBackends, RepositoryOptions, RestoreOptions, RestorePlan, RusticProgress,
+    RusticResult, WriteBackend,
+    repofile::{MasterKey, Metadata, Node, NodeType, SnapshotFile},
 };
 use rustic_testing::{
     TestResult,
@@ -584,4 +590,162 @@ pub fn require_non_root() -> TestResult<()> {
     } else {
         Ok(())
     }
+}
+
+/// Counts the files that a backup reads at the same time.
+///
+/// A read of a file is live from `open` until the drop of the reader.
+/// The archiver drops the reader when it has read and chunked the file, in its parallel stage.
+#[derive(Debug, Default)]
+pub struct ReadCounter {
+    /// The number of files that are open now.
+    live: AtomicUsize,
+    /// The maximum number of files that were open at the same time.
+    peak: AtomicUsize,
+    /// The number of files that were opened.
+    opened: AtomicUsize,
+}
+
+impl ReadCounter {
+    /// Gives the number of files that were opened.
+    #[must_use]
+    pub fn opened(&self) -> usize {
+        self.opened.load(Ordering::SeqCst)
+    }
+
+    /// Gives the maximum number of files that were open at the same time.
+    #[must_use]
+    pub fn peak(&self) -> usize {
+        self.peak.load(Ordering::SeqCst)
+    }
+
+    /// Gives the number of files that are open now.
+    #[must_use]
+    pub fn live(&self) -> usize {
+        self.live.load(Ordering::SeqCst)
+    }
+}
+
+/// The time that the first read of each file of [`CountingSource`] waits, so that the reads of different threads overlap.
+pub const READ_PAUSE: Duration = Duration::from_millis(10);
+
+/// Opens a file of [`CountingSource`].
+#[derive(Debug)]
+pub struct CountingOpen {
+    content: Box<[u8]>,
+    counter: Arc<ReadCounter>,
+}
+
+impl ReadSourceOpen for CountingOpen {
+    type Reader = CountingReader;
+
+    fn open(self) -> RusticResult<Self::Reader> {
+        _ = self.counter.opened.fetch_add(1, Ordering::SeqCst);
+        let now = self.counter.live.fetch_add(1, Ordering::SeqCst) + 1;
+        _ = self.counter.peak.fetch_max(now, Ordering::SeqCst);
+        Ok(CountingReader {
+            content: Cursor::new(self.content),
+            counter: self.counter,
+            paused: false,
+        })
+    }
+}
+
+/// Reads a file of [`CountingSource`]. The drop of the reader ends the read of the file.
+#[derive(Debug)]
+pub struct CountingReader {
+    content: Cursor<Box<[u8]>>,
+    counter: Arc<ReadCounter>,
+    paused: bool,
+}
+
+impl Read for CountingReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if !self.paused {
+            self.paused = true;
+            thread::sleep(READ_PAUSE);
+        }
+        self.content.read(buf)
+    }
+}
+
+impl Drop for CountingReader {
+    fn drop(&mut self) {
+        _ = self.counter.live.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// A source of `count` files below the path `source`, with other content in each file.
+///
+/// Each file has a fixed size and no times, so two backups of the source give the same tree.
+#[derive(Debug)]
+pub struct CountingSource {
+    count: u64,
+    counter: Arc<ReadCounter>,
+}
+
+impl CountingSource {
+    /// Creates a source of `count` files.
+    #[must_use]
+    pub fn new(count: u64) -> Self {
+        Self {
+            count,
+            counter: Arc::default(),
+        }
+    }
+
+    /// Gives the counter of the reads of this source.
+    #[must_use]
+    pub fn counter(&self) -> &ReadCounter {
+        &self.counter
+    }
+}
+
+impl ReadSource for CountingSource {
+    type Open = CountingOpen;
+    type Iter = std::vec::IntoIter<RusticResult<ReadSourceEntry<CountingOpen>>>;
+
+    fn size(&self) -> RusticResult<Option<u64>> {
+        Ok(None)
+    }
+
+    fn entries(&self) -> Self::Iter {
+        (0..self.count)
+            .map(|index| {
+                let name = format!("f{index:03}");
+                let content = content(index, 1_000);
+                let meta = Metadata {
+                    size: content.len() as u64,
+                    ..Metadata::default()
+                };
+                Ok(ReadSourceEntry {
+                    path: Path::new("source").join(&name),
+                    node: Node::new_node(OsStr::new(&name), NodeType::File, meta),
+                    open: Some(CountingOpen {
+                        content,
+                        counter: Arc::clone(&self.counter),
+                    }),
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+    }
+}
+
+/// Backs up `source` into a new repository with the options `opts`, through `Repository::archive`.
+///
+/// # Errors
+///
+/// * If the function cannot create the repository, or the backup fails.
+pub fn archive_counting_source(
+    source: &CountingSource,
+    opts: &BackupOptions,
+) -> TestResult<SnapshotFile> {
+    let repo = init_repo(&fault_injection_backend())?.to_indexed_ids()?;
+    Ok(repo.archive(
+        opts,
+        source,
+        SnapshotFile::default(),
+        &[PathBuf::from("source")],
+    )?)
 }

@@ -81,6 +81,16 @@ fn restore_default_reader_threads() -> TestResult<()> {
     scenarios::restore_default_reader_threads()
 }
 
+#[test]
+fn backup_threads() -> TestResult<()> {
+    scenarios::backup_threads()
+}
+
+#[test]
+fn backup_one_thread_same_tree() -> TestResult<()> {
+    scenarios::backup_one_thread_same_tree()
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn restore_directory_metadata_after_entries() -> TestResult<()> {

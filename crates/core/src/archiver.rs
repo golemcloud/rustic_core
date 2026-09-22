@@ -279,3 +279,420 @@ impl<'a, BE: DecryptFullBackend, I: ReadGlobalIndex> Archiver<'a, BE, I> {
         Ok(self.snap)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        ffi::OsStr,
+        io::{Cursor, Read},
+        num::NonZeroUsize,
+        path::Path,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        },
+        thread,
+        time::Duration,
+    };
+
+    use bytes::Bytes;
+    use rstest::rstest;
+
+    use super::Archiver;
+    use crate::{
+        Id, Progress,
+        archiver::parent::Parent,
+        backend::{
+            BytesList, FileType, ReadBackend, ReadSource, ReadSourceEntry, ReadSourceOpen,
+            WriteBackend,
+            decrypt::DecryptBackend,
+            node::{Metadata, Node, NodeType},
+        },
+        blob::tree::TreeId,
+        chunker::rabin::random_poly,
+        crypto::{CryptoKey, aespoly1305::Key},
+        error::{ErrorKind, RusticError, RusticResult},
+        index::{
+            GlobalIndex,
+            binarysorted::{IndexCollector, IndexType},
+        },
+        repofile::{ConfigFile, SnapshotFile, configfile::RepositoryId},
+    };
+
+    /// The number of directories of the source. Each directory gives one tree blob.
+    const DIRS: usize = 32;
+
+    /// The number of files in each directory. Each file gives one data blob.
+    const FILES_PER_DIR: usize = 2;
+
+    /// The first bytes of each file. The key uses them to find the data blobs of the files.
+    const FILE_MARKER: &[u8] = b"gol-651 file ";
+
+    /// The first bytes of each tree blob. The key uses them to find the tree blobs.
+    const TREE_MARKER: &[u8] = b"{\"nodes\":";
+
+    /// The last bytes of each file, so that a file is larger than its marker and its name.
+    const PADDING: [u8; 1024] = [b'.'; 1024];
+
+    /// The time that each call of the slow stage waits, so that the calls of different threads overlap.
+    const PAUSE: Duration = Duration::from_millis(10);
+
+    /// The number of threads of the controls.
+    ///
+    /// The tests expect more than [`LIMIT_THREADS`] calls at the same time with it.
+    const CONTROL_THREADS: NonZeroUsize = NonZeroUsize::new(6).unwrap();
+
+    /// The number of threads of the limit tests.
+    const LIMIT_THREADS: NonZeroUsize = NonZeroUsize::new(2).unwrap();
+
+    /// A parallel stage of a backup.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Stage {
+        /// Reads and chunks files.
+        Files,
+        /// Compresses and encrypts data blobs.
+        Data,
+        /// Compresses and encrypts tree blobs.
+        Trees,
+    }
+
+    /// Counts the live calls of one stage.
+    #[derive(Debug, Default)]
+    struct Probe {
+        /// The number of calls that run now.
+        live: AtomicUsize,
+        /// The maximum number of calls that ran at the same time.
+        peak: AtomicUsize,
+        /// The number of calls.
+        calls: AtomicUsize,
+        /// If this is set, each call waits [`PAUSE`].
+        slow: AtomicBool,
+    }
+
+    impl Probe {
+        /// Starts a call.
+        fn enter(&self) {
+            _ = self.calls.fetch_add(1, Ordering::SeqCst);
+            let now = self.live.fetch_add(1, Ordering::SeqCst) + 1;
+            _ = self.peak.fetch_max(now, Ordering::SeqCst);
+        }
+
+        /// Waits [`PAUSE`] if the stage is slow.
+        fn pause(&self) {
+            if self.slow.load(Ordering::SeqCst) {
+                thread::sleep(PAUSE);
+            }
+        }
+
+        /// Ends a call.
+        fn leave(&self) {
+            _ = self.live.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    /// The probes of the three stages of one backup.
+    #[derive(Debug, Default)]
+    struct Probes {
+        files: Probe,
+        data: Probe,
+        trees: Probe,
+    }
+
+    impl Probes {
+        /// Gives the probe of a stage.
+        const fn of(&self, stage: Stage) -> &Probe {
+            match stage {
+                Stage::Files => &self.files,
+                Stage::Data => &self.data,
+                Stage::Trees => &self.trees,
+            }
+        }
+    }
+
+    /// A key that counts the live encryptions of data blobs and of tree blobs.
+    ///
+    /// The packer encrypts a blob in `process_data`, inside its parallel stage.
+    /// Thus a live encryption of a blob is a live call of the stage of its packer.
+    /// Other encryptions, for example of index files and pack headers, are not counted.
+    #[derive(Clone, Copy)]
+    struct CountingKey {
+        key: Key,
+        probes: &'static Probes,
+    }
+
+    impl CryptoKey for CountingKey {
+        fn decrypt_data(&self, data: &[u8]) -> RusticResult<Vec<u8>> {
+            self.key.decrypt_data(data)
+        }
+
+        fn encrypt_data(&self, data: &[u8]) -> RusticResult<Vec<u8>> {
+            let probe = if data.starts_with(FILE_MARKER) {
+                Some(&self.probes.data)
+            } else if data.starts_with(TREE_MARKER) {
+                Some(&self.probes.trees)
+            } else {
+                None
+            };
+            if let Some(probe) = probe {
+                probe.enter();
+                probe.pause();
+            }
+            let result = self.key.encrypt_data(data);
+            if let Some(probe) = probe {
+                probe.leave();
+            }
+            result
+        }
+    }
+
+    /// A backend that accepts each write and keeps nothing.
+    #[derive(Debug)]
+    struct DiscardBackend;
+
+    impl ReadBackend for DiscardBackend {
+        fn location(&self) -> String {
+            "discard".to_string()
+        }
+
+        fn list_with_size(&self, _tpe: FileType) -> RusticResult<Vec<(Id, u32)>> {
+            Ok(Vec::new())
+        }
+
+        fn read_full(&self, _tpe: FileType, id: &Id) -> RusticResult<Bytes> {
+            Err(
+                RusticError::new(ErrorKind::Backend, "The backend holds no file `{id}`.")
+                    .attach_context("id", id.to_string()),
+            )
+        }
+
+        fn read_partial(
+            &self,
+            tpe: FileType,
+            id: &Id,
+            _cacheable: bool,
+            _offset: u32,
+            _length: u32,
+        ) -> RusticResult<Bytes> {
+            self.read_full(tpe, id)
+        }
+
+        fn warmup_path(&self, _tpe: FileType, id: &Id) -> String {
+            id.to_string()
+        }
+    }
+
+    impl WriteBackend for DiscardBackend {
+        fn create(&self) -> RusticResult<()> {
+            Ok(())
+        }
+
+        fn write_bytes(
+            &self,
+            _tpe: FileType,
+            _id: &Id,
+            _cacheable: bool,
+            _content: BytesList,
+        ) -> RusticResult<()> {
+            Ok(())
+        }
+
+        fn remove(&self, _tpe: FileType, _id: &Id, _cacheable: bool) -> RusticResult<()> {
+            Ok(())
+        }
+    }
+
+    /// Opens a file of [`CountingSource`]. A call of the files stage is live from `open` until the drop of the reader.
+    #[derive(Debug)]
+    struct CountingOpen {
+        content: Box<[u8]>,
+        probe: &'static Probe,
+    }
+
+    impl ReadSourceOpen for CountingOpen {
+        type Reader = CountingReader;
+
+        fn open(self) -> RusticResult<Self::Reader> {
+            self.probe.enter();
+            Ok(CountingReader {
+                content: Cursor::new(self.content),
+                probe: self.probe,
+                paused: false,
+            })
+        }
+    }
+
+    /// Reads a file of [`CountingSource`], and ends the call of the files stage when it is dropped.
+    #[derive(Debug)]
+    struct CountingReader {
+        content: Cursor<Box<[u8]>>,
+        probe: &'static Probe,
+        paused: bool,
+    }
+
+    impl Read for CountingReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if !self.paused {
+                self.paused = true;
+                self.probe.pause();
+            }
+            self.content.read(buf)
+        }
+    }
+
+    impl Drop for CountingReader {
+        fn drop(&mut self) {
+            self.probe.leave();
+        }
+    }
+
+    /// A source of [`DIRS`] directories with [`FILES_PER_DIR`] files each. Each file has other content.
+    struct CountingSource {
+        probe: &'static Probe,
+    }
+
+    impl ReadSource for CountingSource {
+        type Open = CountingOpen;
+        type Iter = std::vec::IntoIter<RusticResult<ReadSourceEntry<CountingOpen>>>;
+
+        fn size(&self) -> RusticResult<Option<u64>> {
+            Ok(None)
+        }
+
+        fn entries(&self) -> Self::Iter {
+            (0..DIRS)
+                .flat_map(|dir| (0..FILES_PER_DIR).map(move |file| (dir, file)))
+                .map(|(dir, file)| {
+                    let name = format!("f{file}");
+                    let content = [FILE_MARKER, format!("{dir}/{file}").as_bytes(), &PADDING]
+                        .concat()
+                        .into_boxed_slice();
+                    let meta = Metadata {
+                        size: content.len() as u64,
+                        ..Metadata::default()
+                    };
+                    Ok(ReadSourceEntry {
+                        path: Path::new(&format!("d{dir:02}")).join(&name),
+                        node: Node::new_node(OsStr::new(&name), NodeType::File, meta),
+                        open: Some(CountingOpen {
+                            content,
+                            probe: self.probe,
+                        }),
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+        }
+    }
+
+    /// The probes and the tree of one backup.
+    struct Backup {
+        probes: &'static Probes,
+        tree: TreeId,
+    }
+
+    /// Backs up [`CountingSource`] with the given number of threads, and makes the given stage slow.
+    fn backup(threads: Option<NonZeroUsize>, slow: Option<Stage>) -> Backup {
+        let probes: &'static Probes = Box::leak(Box::default());
+        if let Some(stage) = slow {
+            probes.of(stage).slow.store(true, Ordering::SeqCst);
+        }
+        let be = DecryptBackend::new(
+            Arc::new(DiscardBackend),
+            CountingKey {
+                key: Key::new(),
+                probes,
+            },
+        );
+        let index = GlobalIndex::new_from_index(IndexCollector::new(IndexType::Full).into_index());
+        let config = ConfigFile::new(2, RepositoryId::default(), random_poly().unwrap());
+        let parent = Parent::new(&be, &index, Vec::new(), false, false);
+        let archiver = Archiver::new(
+            be,
+            &index,
+            &config,
+            parent,
+            SnapshotFile::default(),
+            false,
+            threads,
+        )
+        .unwrap();
+        let snap = archiver
+            .archive(
+                &CountingSource {
+                    probe: &probes.files,
+                },
+                Path::new(""),
+                None,
+                false,
+                true,
+                &Progress::hidden(),
+            )
+            .unwrap();
+        Backup {
+            probes,
+            tree: snap.tree,
+        }
+    }
+
+    /// Gives the peak of a stage, and checks that the stage had at least [`CONTROL_THREADS`] + 1 calls.
+    ///
+    /// With fewer calls, a peak could not show that the backup ignores the number of threads.
+    fn peak(backup: &Backup, stage: Stage) -> usize {
+        let probe = backup.probes.of(stage);
+        let calls = probe.calls.load(Ordering::SeqCst);
+        assert!(
+            calls > CONTROL_THREADS.get(),
+            "The {stage:?} stage had {calls} calls. The test needs more than {CONTROL_THREADS}."
+        );
+        assert_eq!(probe.live.load(Ordering::SeqCst), 0, "{stage:?}");
+        let peak = probe.peak.load(Ordering::SeqCst);
+        println!("The {stage:?} stage had {calls} calls. At most {peak} ran at the same time.");
+        peak
+    }
+
+    #[rstest]
+    fn a_number_of_threads_limits_each_stage(
+        #[values(Stage::Files, Stage::Data, Stage::Trees)] stage: Stage,
+    ) {
+        let backup = backup(Some(LIMIT_THREADS), Some(stage));
+        let peak = peak(&backup, stage);
+        assert!(
+            (1..=LIMIT_THREADS.get()).contains(&peak),
+            "The {stage:?} stage ran {peak} calls at the same time. The limit is {LIMIT_THREADS} threads."
+        );
+    }
+
+    #[rstest]
+    fn more_threads_run_more_calls_of_each_stage(
+        #[values(Stage::Files, Stage::Data, Stage::Trees)] stage: Stage,
+    ) {
+        let backup = backup(Some(CONTROL_THREADS), Some(stage));
+        let peak = peak(&backup, stage);
+        assert!(
+            (LIMIT_THREADS.get() + 1..=CONTROL_THREADS.get()).contains(&peak),
+            "The {stage:?} stage ran {peak} calls at the same time with {CONTROL_THREADS} threads."
+        );
+    }
+
+    #[rstest]
+    fn without_the_option_each_stage_follows_the_host(
+        #[values(Stage::Files, Stage::Data, Stage::Trees)] stage: Stage,
+    ) {
+        let cores = thread::available_parallelism().unwrap().get();
+        let backup = backup(None, Some(stage));
+        let peak = peak(&backup, stage);
+        assert!(
+            (cores.min(3)..=cores).contains(&peak),
+            "The {stage:?} stage ran {peak} calls at the same time on a host with {cores} cores."
+        );
+    }
+
+    #[rstest]
+    fn one_thread_gives_the_tree_of_the_default(
+        #[values(Stage::Files, Stage::Data, Stage::Trees)] stage: Stage,
+    ) {
+        let backup_one = backup(Some(NonZeroUsize::MIN), Some(stage));
+        assert_eq!(peak(&backup_one, stage), 1, "{stage:?}");
+        assert_eq!(backup_one.tree, backup(None, None).tree);
+    }
+}

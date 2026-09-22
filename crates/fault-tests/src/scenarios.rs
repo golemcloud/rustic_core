@@ -26,12 +26,12 @@ use std::{
     time::SystemTime,
 };
 
+use rustic_core::{BackupOptions, FileType, LsOptions, PruneOptions, RestoreOptions, TreeId};
 #[cfg(target_os = "linux")]
 use rustic_core::{
-    BackupOptions, ReadBackend, RusticResult,
+    ReadBackend, RusticResult,
     repofile::{MasterKey, Metadata, Node, NodeType, SnapshotFile},
 };
-use rustic_core::{FileType, LsOptions, PruneOptions, RestoreOptions};
 #[cfg(target_os = "linux")]
 use rustic_testing::backend::fault_injection_backend::FaultInjectionBackend;
 use rustic_testing::{
@@ -54,8 +54,9 @@ use crate::{
 };
 use crate::{
     fixtures::{
-        SavedRepo, backup, content, expect_error, fault_injection_backend, init_repo, restore_with,
-        save_files, save_files_in_own_packs, save_files_with_cache, shorten_files, write_files,
+        CountingSource, SavedRepo, archive_counting_source, backup, content, expect_error,
+        fault_injection_backend, init_repo, restore_with, save_files, save_files_in_own_packs,
+        save_files_with_cache, shorten_files, write_files,
     },
     panics::{count_panics, wait_until_released},
 };
@@ -93,6 +94,8 @@ pub const SCENARIOS: &[Scenario] = &[
         "restore-default-reader-threads",
         restore_default_reader_threads,
     ),
+    ("backup-threads", backup_threads),
+    ("backup-one-thread-same-tree", backup_one_thread_same_tree),
     #[cfg(target_os = "linux")]
     (
         "restore-directory-metadata-after-entries",
@@ -709,6 +712,101 @@ pub fn restore_default_reader_threads() -> TestResult<()> {
     if !(MINIMUM..=DEFAULT_READER_THREADS).contains(&readers) || most > DEFAULT_READER_THREADS {
         return Err(format!(
             "{readers} threads read packs, and {most} reads overlapped. The default needs at least {MINIMUM} and at most {DEFAULT_READER_THREADS} threads."
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// The number of files of the backups that count their reads.
+const BACKUP_FILES: usize = 64;
+
+/// The number of threads of [`backup_threads`].
+const BACKUP_THREADS: NonZeroUsize = NonZeroUsize::new(2).unwrap();
+
+/// The number of threads of the control of [`backup_threads`]. It must be higher than [`BACKUP_THREADS`].
+const BACKUP_CONTROL_THREADS: NonZeroUsize = NonZeroUsize::new(6).unwrap();
+
+/// Backs up [`BACKUP_FILES`] files through `Repository::archive`, and counts the files that the backup reads at the same time.
+///
+/// The first read of each file waits [`READ_PAUSE`](crate::fixtures::READ_PAUSE), so the reads of different
+/// threads overlap.
+/// A read is live from `open` until the drop of the reader, which the archiver does in its parallel stage.
+///
+/// # Arguments
+///
+/// * `threads` - The value of `BackupOptions::threads`
+///
+/// # Returns
+///
+/// The maximum number of reads that overlapped, and the tree of the snapshot.
+///
+/// # Errors
+///
+/// * If the backup fails.
+/// * If the backup did not open each file one time, or a file is still open after the backup.
+fn count_backup_reads(threads: Option<NonZeroUsize>) -> TestResult<(usize, TreeId)> {
+    let source = CountingSource::new(BACKUP_FILES as u64);
+    let opts = BackupOptions::default().threads(threads);
+    let snap = archive_counting_source(&source, &opts)?;
+    let counter = source.counter();
+    let (opened, live, peak) = (counter.opened(), counter.live(), counter.peak());
+    println!("The backup opened {opened} files. At most {peak} reads overlapped.");
+    if opened != BACKUP_FILES || live != 0 {
+        return Err(format!(
+            "The backup opened {opened} of {BACKUP_FILES} files, and {live} files are still open."
+        )
+        .into());
+    }
+    Ok((peak, snap.tree))
+}
+
+/// A backup with the option `threads` reads at most that number of files at the same time.
+///
+/// The backup has [`BACKUP_THREADS`] threads. A control with [`BACKUP_CONTROL_THREADS`] threads must read more
+/// than [`BACKUP_THREADS`] files at the same time, so the measurement can see a number of threads that the
+/// backup ignores. [`count_backup_reads`] describes the measurement.
+///
+/// # Errors
+///
+/// * If a backup fails.
+/// * If the backup with [`BACKUP_THREADS`] threads reads more than [`BACKUP_THREADS`] files at the same time.
+/// * If the backup with [`BACKUP_CONTROL_THREADS`] threads reads [`BACKUP_THREADS`] files or fewer, or more than
+///   [`BACKUP_CONTROL_THREADS`] files, at the same time.
+pub fn backup_threads() -> TestResult<()> {
+    let (peak, _) = count_backup_reads(Some(BACKUP_THREADS))?;
+    if !(1..=BACKUP_THREADS.get()).contains(&peak) {
+        return Err(format!(
+            "{peak} reads overlapped with {BACKUP_THREADS} threads. The maximum is {BACKUP_THREADS}."
+        )
+        .into());
+    }
+    let (control, _) = count_backup_reads(Some(BACKUP_CONTROL_THREADS))?;
+    if !(BACKUP_THREADS.get() + 1..=BACKUP_CONTROL_THREADS.get()).contains(&control) {
+        return Err(format!(
+            "{control} reads overlapped with {BACKUP_CONTROL_THREADS} threads. The control needs more than {BACKUP_THREADS} and at most {BACKUP_CONTROL_THREADS}."
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// A backup with one thread reads one file at a time, and gives the tree of a backup without the option `threads`.
+///
+/// # Errors
+///
+/// * If a backup fails.
+/// * If the backup with one thread reads more than one file at the same time.
+/// * If the two backups give different trees.
+pub fn backup_one_thread_same_tree() -> TestResult<()> {
+    let (peak, one) = count_backup_reads(Some(NonZeroUsize::MIN))?;
+    if peak != 1 {
+        return Err(format!("{peak} reads overlapped with one thread.").into());
+    }
+    let (_, default) = count_backup_reads(None)?;
+    if one != default {
+        return Err(format!(
+            "The backup with one thread gives the tree `{one}`, and the backup without the option gives `{default}`."
         )
         .into());
     }
