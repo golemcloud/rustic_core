@@ -2,6 +2,7 @@
 use std::os::unix::fs::{PermissionsExt, symlink};
 
 use std::{
+    collections::BTreeSet,
     fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     num::TryFromIntError,
@@ -141,6 +142,20 @@ pub enum LocalDestinationErrorKind {
 }
 
 pub(crate) type LocalDestinationResult<T> = Result<T, LocalDestinationErrorKind>;
+
+/// The namespace of the extended attributes that the kernel owns.
+///
+/// A user without privilege cannot set an extended attribute of this namespace. For example, a volume that is
+/// mounted with `seclabel` gives each file the label `security.selinux`, a backup records the label, and a
+/// restore of that backup cannot set it.
+#[cfg(not(any(windows, target_os = "openbsd")))]
+const KERNEL_XATTR_NAMESPACE: &str = "security.";
+
+/// The names of the extended attributes that the kernel owns and that a restore already reported.
+///
+/// [`LocalDestination::set_extended_attributes`] adds a name to the set when it writes the warning for that
+/// name. Thus a restore writes one warning for each such name, and not one warning for each file.
+pub(crate) type KernelXattrNames = BTreeSet<Box<str>>;
 
 #[derive(Clone, Debug)]
 /// Local destination, used when restoring.
@@ -471,6 +486,7 @@ impl LocalDestination {
     ///
     /// * `item` - The item to set the extended attributes for
     /// * `extended_attributes` - The extended attributes to set
+    /// * `kernel_names` - The names of the kernel-owned extended attributes that the restore already reported
     ///
     /// # Errors
     ///
@@ -480,7 +496,55 @@ impl LocalDestination {
         &self,
         _item: impl AsRef<Path>,
         _extended_attributes: &[ExtendedAttribute],
+        _kernel_names: &mut KernelXattrNames,
     ) -> LocalDestinationResult<()> {
+        Ok(())
+    }
+
+    #[cfg(not(any(windows, target_os = "openbsd")))]
+    /// Set the extended attribute `attribute` of the file `filename`
+    ///
+    /// The kernel owns the extended attributes of the namespace [`KERNEL_XATTR_NAMESPACE`]. A user without
+    /// privilege cannot set such an attribute, so a failed set of one is not an error. This function then
+    /// writes a warning and gives `Ok`. A failed removal of an attribute that only the destination has follows
+    /// the same rule. The restore keeps the attribute that the destination has, and it sets the other extended
+    /// attributes of the same file.
+    ///
+    /// The function adds the name of the attribute to `kernel_names` when it writes the warning, and it writes
+    /// the warning only for a name that `kernel_names` does not hold. Thus a restore writes one warning for
+    /// each such name, and not one warning for each file.
+    ///
+    /// # Arguments
+    ///
+    /// * `filename` - The file to set the extended attribute of
+    /// * `attribute` - The extended attribute to set
+    /// * `kernel_names` - The names of the kernel-owned extended attributes that the restore already reported
+    ///
+    /// # Errors
+    ///
+    /// * If the extended attribute could not be set, and the kernel does not own it.
+    fn set_xattr(
+        filename: &Path,
+        attribute: &ExtendedAttribute,
+        kernel_names: &mut KernelXattrNames,
+    ) -> LocalDestinationResult<()> {
+        let ExtendedAttribute { name, value } = attribute;
+        let Err(err) = xattr::set(filename, name, value.as_ref().unwrap_or(&Vec::new())) else {
+            return Ok(());
+        };
+        if !name.starts_with(KERNEL_XATTR_NAMESPACE) {
+            return Err(LocalDestinationErrorKind::SettingXattrFailed {
+                name: name.clone(),
+                filename: filename.to_path_buf(),
+                source: err,
+            });
+        }
+        if kernel_names.insert(name.as_str().into()) {
+            warn!(
+                "error setting xattr {name} on {}: {err}. The kernel owns the namespace `{KERNEL_XATTR_NAMESPACE}`, so the restore keeps the attribute of the destination and does not report this name again.",
+                filename.display()
+            );
+        }
         Ok(())
     }
 
@@ -491,12 +555,14 @@ impl LocalDestination {
     ///
     /// * `item` - The item to set the extended attributes for
     /// * `extended_attributes` - The extended attributes to set
+    /// * `kernel_names` - The names of the kernel-owned extended attributes that the restore already reported
     ///
     /// # Errors
     ///
     /// * If listing the extended attributes failed.
     /// * If getting an extended attribute failed.
-    /// * If setting an extended attribute failed.
+    /// * If setting an extended attribute failed, and the kernel does not own the attribute. A failed set of an
+    ///   attribute that the kernel owns is a warning. [`Self::set_xattr`] describes the rule.
     ///
     /// # Returns
     ///
@@ -509,6 +575,7 @@ impl LocalDestination {
         &self,
         item: impl AsRef<Path>,
         extended_attributes: &[ExtendedAttribute],
+        kernel_names: &mut KernelXattrNames,
     ) -> LocalDestinationResult<()> {
         let filename = self.path(item);
         let mut done = vec![false; extended_attributes.len()];
@@ -522,21 +589,16 @@ impl LocalDestination {
             match extended_attributes.iter().enumerate().find(
                 |(_, ExtendedAttribute { name, .. })| name == curr_name.to_string_lossy().as_ref(),
             ) {
-                Some((index, ExtendedAttribute { name, value })) => {
-                    let curr_value = xattr::get(&filename, name).map_err(|err| {
+                Some((index, attribute)) => {
+                    let curr_value = xattr::get(&filename, &attribute.name).map_err(|err| {
                         LocalDestinationErrorKind::GettingXattrFailed {
-                            name: name.clone(),
+                            name: attribute.name.clone(),
                             filename: filename.clone(),
                             source: err,
                         }
                     })?;
-                    if value != &curr_value {
-                        xattr::set(&filename, name, value.as_ref().unwrap_or(&Vec::new()))
-                            .map_err(|err| LocalDestinationErrorKind::SettingXattrFailed {
-                                name: name.clone(),
-                                filename: filename.clone(),
-                                source: err,
-                            })?;
+                    if attribute.value != curr_value {
+                        Self::set_xattr(&filename, attribute, kernel_names)?;
                     }
                     done[index] = true;
                 }
@@ -552,15 +614,9 @@ impl LocalDestination {
             }
         }
 
-        for (index, ExtendedAttribute { name, value }) in extended_attributes.iter().enumerate() {
+        for (index, attribute) in extended_attributes.iter().enumerate() {
             if !done[index] {
-                xattr::set(&filename, name, value.as_ref().unwrap_or(&Vec::new())).map_err(
-                    |err| LocalDestinationErrorKind::SettingXattrFailed {
-                        name: name.clone(),
-                        filename: filename.clone(),
-                        source: err,
-                    },
-                )?;
+                Self::set_xattr(&filename, attribute, kernel_names)?;
             }
         }
 

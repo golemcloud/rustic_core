@@ -16,7 +16,7 @@ use crate::{
     backend::{
         FileType, ReadBackend,
         decrypt::DecryptReadBackend,
-        local_destination::{LocalDestination, LocalDestinationResult},
+        local_destination::{KernelXattrNames, LocalDestination, LocalDestinationResult},
         node::{Node, NodeType},
     },
     blob::{BlobLocation, BlobLocations},
@@ -75,7 +75,18 @@ pub struct RestoreOptions {
     /// remove such an attribute, it logs a warning, also with this option. An attribute that the restore
     /// cannot remove is usually a label that the kernel owns. For example, the kernel refuses the removal of
     /// `security.selinux` with `EACCES`, and each file that a program creates in the destination gets that
-    /// label. If the restore cannot find the ID of a user or group name, it uses the saved numeric ID, also
+    /// label.
+    ///
+    /// The kernel owns the extended attributes of the namespace `security.`, and a user without privilege
+    /// cannot set such an attribute. A volume that is mounted with `seclabel` gives each file the label
+    /// `security.selinux`, a backup records the label, and a restore of that backup cannot set it. If the
+    /// restore cannot set an extended attribute of that namespace, it keeps the attribute of the destination,
+    /// sets the other extended attributes of the same file, and logs a warning, also with this option. Thus
+    /// the rule for a failed set matches the rule for a failed removal. The restore logs one warning for each
+    /// such name, and not one warning for each file. A failed set of an extended attribute of another
+    /// namespace is an error with this option.
+    ///
+    /// If the restore cannot find the ID of a user or group name, it uses the saved numeric ID, also
     /// with this option. On Windows, the restore sets only the times. On OpenBSD, the restore does not set
     /// extended attributes.
     #[cfg_attr(feature = "clap", clap(long))]
@@ -405,6 +416,10 @@ fn restore_metadata(
     opts: RestoreOptions,
     dest: &LocalDestination,
 ) -> RusticResult<()> {
+    // The names of the kernel-owned extended attributes that this restore already reported. This function
+    // runs on one thread, so the set needs no lock. The set holds one name for each such attribute, so it
+    // does not grow with the number of entries.
+    let mut kernel_names = KernelXattrNames::new();
     let mut dir_stack = Vec::new();
     while let Some((path, node)) = node_streamer.next().transpose()? {
         // Create hardlink directly, if this is one.
@@ -436,18 +451,18 @@ fn restore_metadata(
                         break;
                     }
                     let (path, node) = dir_stack.pop().unwrap();
-                    set_metadata(dest, opts, &path, &node)?;
+                    set_metadata(dest, opts, &path, &node, &mut kernel_names)?;
                 }
                 // push current path to the stack
                 dir_stack.push((path, node));
             }
-            _ => set_metadata(dest, opts, &path, &node)?,
+            _ => set_metadata(dest, opts, &path, &node, &mut kernel_names)?,
         }
     }
 
     // empty dir stack and set metadata
     for (path, node) in dir_stack.into_iter().rev() {
-        set_metadata(dest, opts, &path, &node)?;
+        set_metadata(dest, opts, &path, &node, &mut kernel_names)?;
     }
 
     Ok(())
@@ -472,17 +487,23 @@ fn hardlink_key(node: &Node) -> Option<HardlinkKey> {
 /// * `opts` - The restore options to use
 /// * `path` - The path of the file or directory
 /// * `node` - The node information of the file or directory
+/// * `kernel_names` - The names of the kernel-owned extended attributes that the restore already reported
 ///
 /// # Errors
 ///
 /// * If `opts.fail_on_metadata_error` is set and this function cannot set the metadata. Then this function returns the first error.
 ///
 /// If `opts.fail_on_metadata_error` is not set, this function logs a warning for each error and returns `Ok`.
+///
+/// A failed set of an extended attribute that the kernel owns is a warning, also with
+/// `opts.fail_on_metadata_error`. The private function `set_xattr` of
+/// [`LocalDestination::set_extended_attributes`] describes the rule.
 pub(crate) fn set_metadata(
     dest: &LocalDestination,
     opts: RestoreOptions,
     path: &PathBuf,
     node: &Node,
+    kernel_names: &mut KernelXattrNames,
 ) -> RusticResult<()> {
     debug!("setting metadata for {}", path.display());
     // Gives the error of `result` if `opts.fail_on_metadata_error` is set. Else logs `warning` and gives `Ok`.
@@ -528,7 +549,7 @@ pub(crate) fn set_metadata(
         "chmod failed.",
     )?;
     check(
-        dest.set_extended_attributes(path, &node.meta.extended_attributes),
+        dest.set_extended_attributes(path, &node.meta.extended_attributes, kernel_names),
         "The restore cannot set the extended attributes of `{path}`.",
         "setting extended attributes failed.",
     )?;
