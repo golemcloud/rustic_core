@@ -144,6 +144,15 @@ pub struct RepositoryOptions {
     #[cfg_attr(feature = "clap", clap(long, global = true))]
     #[cfg_attr(feature = "merge", merge(strategy = conflate::option::overwrite_none))]
     pub warm_up_batch: Option<usize>,
+
+    /// Read a blob from a pack that a prune marked for deletion when no other pack holds it
+    ///
+    /// This option applies to the full index of [`Repository::to_indexed`], which a restore uses. A blob that a pack
+    /// in the `packs` of an index file holds comes from that pack. A prune that sees a snapshot that uses a marked pack
+    /// keeps that pack.
+    #[cfg_attr(feature = "clap", clap(long, global = true))]
+    #[cfg_attr(feature = "merge", merge(strategy = conflate::bool::overwrite_false))]
+    pub index_marked_packs: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1096,6 +1105,9 @@ impl<S: Open> Repository<S> {
 
     /// Turn the repository into the `IndexedFull` state by reading and storing the index
     ///
+    /// With [`RepositoryOptions::index_marked_packs`], the index also holds the blobs that only packs marked for
+    /// deletion hold.
+    ///
     /// # Errors
     ///
     // TODO: Document errors
@@ -1104,7 +1116,12 @@ impl<S: Open> Repository<S> {
     ///
     /// This saves the full index in memory which can be quite memory-consuming!
     pub fn to_indexed(self) -> RusticResult<Repository<IndexedFullStatus>> {
-        let index = GlobalIndex::new(self.dbe(), &self.progress_counter(""))?;
+        let p = self.progress_counter("");
+        let index = if self.opts.index_marked_packs {
+            GlobalIndex::with_marked_packs(self.dbe(), &p)?
+        } else {
+            GlobalIndex::new(self.dbe(), &p)?
+        };
         Ok(self.into_indexed_with_index(index))
     }
 
