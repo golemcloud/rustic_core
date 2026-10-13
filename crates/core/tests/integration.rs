@@ -34,6 +34,7 @@ mod integration {
     mod key;
     mod ls;
     mod marked_packs;
+    mod pack_write;
     mod prune;
     mod repair_snapshots;
     mod restore;
