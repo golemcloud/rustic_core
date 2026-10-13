@@ -327,9 +327,7 @@ impl GlobalIndex {
         }
         p.finish();
 
-        // Keep the size of each marked pack before the filter removes blobs from its list.
         collector.extend(marked.into_iter().filter_map(|mut pack| {
-            pack.size = Some(pack.pack_size());
             pack.blobs
                 .retain(|blob| indexed.insert((blob.tpe, blob.id)));
             (!pack.blobs.is_empty()).then_some(pack)
