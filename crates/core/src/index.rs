@@ -1,4 +1,4 @@
-use std::{sync::Arc, thread::sleep};
+use std::{collections::HashSet, sync::Arc, thread::sleep};
 
 use bytes::Bytes;
 use derive_more::Constructor;
@@ -294,6 +294,48 @@ impl GlobalIndex {
     /// * `p` - The progress tracker
     pub fn new(be: &impl DecryptReadBackend, p: &Progress) -> RusticResult<Self> {
         Self::new_from_collector(be, p, IndexCollector::new(IndexType::Full))
+    }
+
+    /// Create a new [`GlobalIndex`] that also holds the blobs of packs that a prune marked for deletion
+    ///
+    /// A blob that a pack in the `packs` of an index file holds comes from that pack. A blob that only packs in the
+    /// `packs_to_delete` of index files hold comes from one of these marked packs.
+    ///
+    /// # Arguments
+    ///
+    /// * `be` - The backend to read from
+    /// * `p` - The progress tracker
+    ///
+    /// # Errors
+    ///
+    /// * If the index could not be read
+    pub fn with_marked_packs(be: &impl DecryptReadBackend, p: &Progress) -> RusticResult<Self> {
+        p.set_title("reading index...");
+        let mut collector = IndexCollector::new(IndexType::Full);
+        let mut indexed = HashSet::new();
+        let mut marked = Vec::new();
+        for index in be.stream_all::<IndexFile>(p)? {
+            let index = index?.1;
+            indexed.extend(
+                index
+                    .packs
+                    .iter()
+                    .flat_map(|pack| pack.blobs.iter().map(|blob| (blob.tpe, blob.id))),
+            );
+            collector.extend(index.packs);
+            marked.extend(index.packs_to_delete);
+        }
+        p.finish();
+
+        // Keep the size of each marked pack before the filter removes blobs from its list.
+        collector.extend(marked.into_iter().filter_map(|mut pack| {
+            pack.size = Some(pack.pack_size());
+            pack.blobs
+                .retain(|blob| indexed.insert((blob.tpe, blob.id)));
+            (!pack.blobs.is_empty()).then_some(pack)
+        }));
+
+        Ok(Self::new_from_index(collector.into_index()))
     }
 
     /// Create a new [`GlobalIndex`] with only full trees
