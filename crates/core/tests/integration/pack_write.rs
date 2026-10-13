@@ -75,13 +75,16 @@ enum FailingPacks {
     FirstTree,
 }
 
-/// The writes of data packs and of tree packs that the backend refused or wrote.
+/// The writes of data packs and of tree packs that the backend refused or wrote, and the most
+/// blobs that one data pack and one tree pack held.
 #[derive(Default)]
 struct PackWrites {
     refused_data: AtomicUsize,
     refused_tree: AtomicUsize,
     written_data: AtomicUsize,
     written_tree: AtomicUsize,
+    most_data_blobs: AtomicUsize,
+    most_tree_blobs: AtomicUsize,
 }
 
 /// Backend that fails the pack writes of `failing` with [`StorageFault`] as the source of the error.
@@ -115,11 +118,12 @@ impl PackWriteFaults {
         }
     }
 
-    /// Tells if the pack `content` holds tree blobs.
+    /// Tells if the pack `content` holds tree blobs, and gives the number of its blobs.
     ///
     /// The pack ends with its encrypted header and the length of that header. Each entry of the
     /// header starts with the type of its blob: 0 or 2 for a data blob, 1 or 3 for a tree blob.
-    fn holds_trees(&self, content: &BytesList) -> bool {
+    /// An entry of an uncompressed blob has 37 bytes, and an entry of a compressed blob has 41.
+    fn header(&self, content: &BytesList) -> (bool, usize) {
         let pack = content.slice().concat();
         let (rest, length) = pack.split_at(pack.len() - 4);
         let length = u32::from_le_bytes(length.try_into().expect("the length has 4 bytes"));
@@ -129,12 +133,19 @@ impl PackWriteFaults {
             .key
             .decrypt(Nonce::<Aes256CtrPoly1305Aes>::from_slice(nonce), sealed)
             .expect("the header of the pack decrypts");
-        matches!(header[0], 1 | 3)
+        let entry = if matches!(header[0], 2 | 3) { 41 } else { 37 };
+        (matches!(header[0], 1 | 3), header.len() / entry)
     }
 
     /// Tells if the write of the pack `content` fails, and counts the write.
     fn fails(&self, content: &BytesList) -> bool {
-        let tree = self.holds_trees(content);
+        let (tree, blobs) = self.header(content);
+        let most = if tree {
+            &self.writes.most_tree_blobs
+        } else {
+            &self.writes.most_data_blobs
+        };
+        _ = most.fetch_max(blobs, Ordering::SeqCst);
         let fails = match self.failing {
             FailingPacks::Each => true,
             FailingPacks::EachData => !tree,
@@ -218,9 +229,13 @@ fn backup_with_failed_pack_writes(
         &KeyOptions::default(),
         &ConfigOptions::default(),
     )?;
-    let config = ConfigOptions::default().set_treepack_size(ByteSize::b(1));
+    let config = ConfigOptions::default()
+        .set_treepack_size(ByteSize::b(1))
+        .set_treepack_growfactor(0);
     let config = match failing {
-        FailingPacks::Each | FailingPacks::EachData => config.set_datapack_size(ByteSize::b(1)),
+        FailingPacks::Each | FailingPacks::EachData => config
+            .set_datapack_size(ByteSize::b(1))
+            .set_datapack_growfactor(0),
         FailingPacks::FirstTree => config,
     };
     _ = repo.apply_config(&config)?;
@@ -233,8 +248,8 @@ fn backup_with_failed_pack_writes(
     Ok((backend, snap))
 }
 
-/// Checks that `snap` has the error of the storage in its chain of sources, and that `backend`
-/// holds no snapshot file.
+/// Checks that `snap` has the error of the storage in its chain of sources, that `backend` holds
+/// no snapshot file, and that each pack that [`FailingPacks`] says holds one blob held one blob.
 fn expect_storage_error(backend: &PackWriteFaults, snap: RusticResult<SnapshotFile>) -> Result<()> {
     let err = snap.expect_err("the backup cannot write its packs");
     let first: &(dyn Error + 'static) = &*err;
@@ -244,6 +259,11 @@ fn expect_storage_error(backend: &PackWriteFaults, snap: RusticResult<SnapshotFi
         "the backup does not return the error of the storage: {err:?}"
     );
     assert_eq!(backend.list(FileType::Snapshot)?.len(), 0);
+    let writes = &backend.writes;
+    assert_eq!(writes.most_tree_blobs.load(Ordering::SeqCst), 1);
+    if !matches!(backend.failing, FailingPacks::FirstTree) {
+        assert_eq!(writes.most_data_blobs.load(Ordering::SeqCst), 1);
+    }
     Ok(())
 }
 
